@@ -1,18 +1,22 @@
 
 // vertex shader
 
+struct VertexInput {
+    @location(0) position: vec3f,
+    @location(1) color: vec3f,
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4f,
+    @location(0) color: vec3f
 }
 
 @vertex
-fn vertex_main(
-    @builtin(vertex_index) in_vertex_index: u32,
-) -> VertexOutput {
+fn vertex_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let x = f32(1 - i32(in_vertex_index)) * 0.5;
-    let y = f32(i32(in_vertex_index & 1u) * 2 - 1) * 0.5;
-    out.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+
+    out.clip_position = vec4f(model.position, 1.0);
+    out.color = model.color;
     return out;
 }
 
@@ -21,5 +25,5 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
-    return vec4f(0.3, 0.2, 0.1, 1.0);
+    return vec4f(in.color, 1.0);
 }
