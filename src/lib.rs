@@ -12,6 +12,8 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod texture;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
@@ -76,6 +78,7 @@ pub struct State {
     index_buffer: wgpu::Buffer,
     index_count: u32, // length of index buffer
     texture_bind_group: wgpu::BindGroup,
+    texture: texture::Texture,
     window: Arc<Window>, // the actual window object
 }
 
@@ -152,59 +155,9 @@ impl State {
         };
 
         let texture_bytes = include_bytes!("cat.png");
-        let texture_image = image::load_from_memory(texture_bytes).unwrap().to_rgba8();
-
-        let texture_dimensions = texture_image.dimensions();
-        let texture_size = wgpu::Extent3d {
-            width: texture_dimensions.0,
-            height: texture_dimensions.1,
-            depth_or_array_layers: 1,
-        };
-
-        // this creates the texture object on the gpu but it has no data in it
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            label: Some("image texture"),
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &texture_image,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * texture_dimensions.0),
-                rows_per_image: Some(texture_dimensions.1),
-            },
-            texture_size,
-        );
-
-        // the texture now has data in it but it needs a TextureView to access it
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // to configure how it gets sampled it needs a Sampler (this can be reused)
-        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest, // when image is too small
-            min_filter: wgpu::FilterMode::Nearest, // when image is too big
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
 
         // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
-
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -236,11 +189,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                    resource: wgpu::BindingResource::TextureView(&texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
                 },
             ],
             label: Some("texture bind group"),
@@ -318,6 +271,7 @@ impl State {
             index_buffer,
             index_count,
             texture_bind_group,
+            texture,
             window,
         })
     }
