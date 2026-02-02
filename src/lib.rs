@@ -12,6 +12,7 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+mod camera;
 mod texture;
 
 #[repr(C)]
@@ -73,6 +74,10 @@ pub struct State {
     is_surface_configured: bool,
     device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
     queue: wgpu::Queue,   // the command queue to send things to the device
+    camera: camera::Camera,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    camera_controller: camera::CameraController,
     render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
     vertex_buffer: wgpu::Buffer,           // buffer where vertices are stored and passed to the gpu
     index_buffer: wgpu::Buffer,
@@ -94,16 +99,6 @@ impl State {
             backends: wgpu::Backends::GL,
             ..Default::default()
         });
-
-        // log::debug!(
-        //     "{:?}",
-        //     instance
-        //         .enumerate_adapters(wgpu::Backends::all())
-        //         .await
-        //         .iter()
-        //         .map(|a| a.get_info())
-        //         .collect::<Vec<wgpu::AdapterInfo>>()
-        // );
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
@@ -153,6 +148,39 @@ impl State {
             desired_maximum_frame_latency: 2,
             view_formats: vec![],
         };
+
+        let camera = camera::Camera::new(size.width as f32 / size.height as f32, 90.0);
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera.to_uniform()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout"),
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("camera_bind_group"),
+        });
+
+        let camera_controller = camera::CameraController::new(0.01);
 
         let texture_bytes = include_bytes!("cat.png");
         let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
@@ -218,7 +246,7 @@ impl State {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render pipeline layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
+                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
                 immediate_size: 0,
             });
 
@@ -266,6 +294,10 @@ impl State {
             is_surface_configured: true,
             device,
             queue,
+            camera,
+            camera_buffer,
+            camera_bind_group,
+            camera_controller,
             render_pipeline,
             vertex_buffer,
             index_buffer,
@@ -277,7 +309,12 @@ impl State {
     }
 
     pub fn update(&mut self) {
-        // nothing here rn
+        self.camera_controller.update_camera(&mut self.camera);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera.to_uniform()]),
+        );
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -345,6 +382,7 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
 
             render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -360,10 +398,12 @@ impl State {
         Ok(())
     }
 
-    pub fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
+    pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
-            _ => {}
+            _ => {
+                self.camera_controller.handle_key(code, is_pressed);
+            }
         }
     }
 }
