@@ -16,16 +16,30 @@ use wasm_bindgen::prelude::*;
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
-    color: [f32; 3],
+    tex_coords: [f32; 2],
 }
 
-#[rustfmt::skip]
 const VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.0868241, 0.49240386, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [-0.49513406, 0.06958647, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [-0.21918549, -0.44939706, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [0.35966998, -0.3473291, 0.0], color: [0.5, 0.0, 0.5] },
-    Vertex { position: [0.44147372, 0.2347359, 0.0], color: [0.5, 0.0, 0.5] },
+    Vertex {
+        position: [-0.0868241, 0.49240386, 0.0],
+        tex_coords: [0.4131759, 0.00759614],
+    },
+    Vertex {
+        position: [-0.49513406, 0.06958647, 0.0],
+        tex_coords: [0.0048659444, 0.43041354],
+    },
+    Vertex {
+        position: [-0.21918549, -0.44939706, 0.0],
+        tex_coords: [0.28081453, 0.949397],
+    },
+    Vertex {
+        position: [0.35966998, -0.3473291, 0.0],
+        tex_coords: [0.85967, 0.84732914],
+    },
+    Vertex {
+        position: [0.44147372, 0.2347359, 0.0],
+        tex_coords: [0.9414737, 0.2652641],
+    },
 ];
 
 const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, 0];
@@ -44,7 +58,7 @@ impl Vertex {
                 wgpu::VertexAttribute {
                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
                     shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
             ],
         }
@@ -60,7 +74,8 @@ pub struct State {
     render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
     vertex_buffer: wgpu::Buffer,           // buffer where vertices are stored and passed to the gpu
     index_buffer: wgpu::Buffer,
-    index_count: u32,    // length of index buffer
+    index_count: u32, // length of index buffer
+    texture_bind_group: wgpu::BindGroup,
     window: Arc<Window>, // the actual window object
 }
 
@@ -136,6 +151,101 @@ impl State {
             view_formats: vec![],
         };
 
+        let texture_bytes = include_bytes!("cat.png");
+        let texture_image = image::load_from_memory(texture_bytes).unwrap().to_rgba8();
+
+        let texture_dimensions = texture_image.dimensions();
+        let texture_size = wgpu::Extent3d {
+            width: texture_dimensions.0,
+            height: texture_dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        // this creates the texture object on the gpu but it has no data in it
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some("image texture"),
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &texture_image,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * texture_dimensions.0),
+                rows_per_image: Some(texture_dimensions.1),
+            },
+            texture_size,
+        );
+
+        // the texture now has data in it but it needs a TextureView to access it
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // to configure how it gets sampled it needs a Sampler (this can be reused)
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest, // when image is too small
+            min_filter: wgpu::FilterMode::Nearest, // when image is too big
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
+
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    // the texture data binding layout
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    // the sampler binding layout
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("texture bind group layout"),
+            });
+
+        // bind group layouts can be be reused with various different bind groups to allow swapping the data on the fly
+        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+            ],
+            label: Some("texture bind group"),
+        });
+
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/shader.wgsl"));
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -155,7 +265,7 @@ impl State {
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render pipeline layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&texture_bind_group_layout],
                 immediate_size: 0,
             });
 
@@ -207,6 +317,7 @@ impl State {
             vertex_buffer,
             index_buffer,
             index_count,
+            texture_bind_group,
             window,
         })
     }
@@ -278,8 +389,12 @@ impl State {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
+
+            render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
+
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+
             render_pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
 
