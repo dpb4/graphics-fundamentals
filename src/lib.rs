@@ -19,20 +19,16 @@ struct Vertex {
     color: [f32; 3],
 }
 
+#[rustfmt::skip]
 const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [0.0, 0.5, 0.0],
-        color: [1.0, 0.0, 0.0],
-    },
-    Vertex {
-        position: [-0.5, -0.5, 0.0],
-        color: [0.0, 1.0, 0.0],
-    },
-    Vertex {
-        position: [0.5, -0.5, 0.0],
-        color: [0.0, 0.0, 1.0],
-    },
+    Vertex { position: [-0.0868241, 0.49240386, 0.0], color: [0.5, 0.0, 0.5] },
+    Vertex { position: [-0.49513406, 0.06958647, 0.0], color: [0.5, 0.0, 0.5] },
+    Vertex { position: [-0.21918549, -0.44939706, 0.0], color: [0.5, 0.0, 0.5] },
+    Vertex { position: [0.35966998, -0.3473291, 0.0], color: [0.5, 0.0, 0.5] },
+    Vertex { position: [0.44147372, 0.2347359, 0.0], color: [0.5, 0.0, 0.5] },
 ];
+
+const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, 0];
 
 impl Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -61,9 +57,10 @@ pub struct State {
     is_surface_configured: bool,
     device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
     queue: wgpu::Queue,   // the command queue to send things to the device
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    vertex_count: u32,
+    render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
+    vertex_buffer: wgpu::Buffer,           // buffer where vertices are stored and passed to the gpu
+    index_buffer: wgpu::Buffer,
+    index_count: u32,    // length of index buffer
     window: Arc<Window>, // the actual window object
 }
 
@@ -80,15 +77,15 @@ impl State {
             ..Default::default()
         });
 
-        log::debug!(
-            "{:?}",
-            instance
-                .enumerate_adapters(wgpu::Backends::all())
-                .await
-                .iter()
-                .map(|a| a.get_info())
-                .collect::<Vec<wgpu::AdapterInfo>>()
-        );
+        // log::debug!(
+        //     "{:?}",
+        //     instance
+        //         .enumerate_adapters(wgpu::Backends::all())
+        //         .await
+        //         .iter()
+        //         .map(|a| a.get_info())
+        //         .collect::<Vec<wgpu::AdapterInfo>>()
+        // );
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
@@ -120,7 +117,7 @@ impl State {
 
         let surface_capabilities = surface.get_capabilities(&adapter);
 
-        // find a usable srgb format, otherwise just fall back to the first one
+        // find a usable srgb format, otherwise just fall back to the first format
         let surface_format = surface_capabilities
             .formats
             .iter()
@@ -133,9 +130,9 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: *surface_capabilities.present_modes.get(0).unwrap(), // this essentially controls vsync
+            present_mode: surface_capabilities.present_modes[0], // this essentially controls vsync
+            alpha_mode: surface_capabilities.alpha_modes[0],
             desired_maximum_frame_latency: 2,
-            alpha_mode: *surface_capabilities.alpha_modes.get(0).unwrap(),
             view_formats: vec![],
         };
 
@@ -147,7 +144,13 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        let vertex_count = VERTICES.len() as u32;
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("index buffer"),
+            contents: bytemuck::cast_slice(INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let index_count = INDICES.len() as u32;
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -202,7 +205,8 @@ impl State {
             queue,
             render_pipeline,
             vertex_buffer,
-            vertex_count,
+            index_buffer,
+            index_count,
             window,
         })
     }
@@ -249,7 +253,7 @@ impl State {
         // encode the rendering pass:
         {
             let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("render pass"),
                 color_attachments: &[
                     // location[0] refers to this color attachment
                     Some(wgpu::RenderPassColorAttachment {
@@ -275,7 +279,8 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..self.vertex_count, 0..1);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
 
         // close the command encoder and submit the instructions to the gpu's render queue
