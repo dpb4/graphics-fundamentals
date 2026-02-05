@@ -11,6 +11,7 @@ var<uniform> camera: CameraUniform;
 struct VertexInput {
     @location(0) position: vec3f,
     @location(1) tex_coords: vec2f,
+    @location(2) normal: vec3f
 }
 
 struct VertexOutput {
@@ -38,4 +39,5 @@ var texture_sampler: sampler;
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
     return textureSample(texture, texture_sampler, in.tex_coords);
+    // return vec4f(1.0, 1.0, 0.0, 1.0);
 }
