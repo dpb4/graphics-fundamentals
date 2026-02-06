@@ -16,7 +16,7 @@ use winit::{
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use crate::model::Vertex;
+use crate::model::{DrawModel, Vertex};
 
 mod camera;
 mod model;
@@ -64,9 +64,11 @@ pub struct State {
     surface_config: wgpu::SurfaceConfiguration, // configuring the surface (size, colour format, etc)
     is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
+    debug_light_render_pipeline: wgpu::RenderPipeline,
     camera: camera::Camera,
     projection: camera::Projection,
     model: model::Model,
+    debug_light_model: model::Model,
     per_frame_bind_group: wgpu::BindGroup, // uniforms like camera, lights, etc
     per_pass_bind_group: wgpu::BindGroup,  // things like textures, materials, etc
     per_object_bind_group: wgpu::BindGroup, // local things like model position or rotation, etc
@@ -193,6 +195,7 @@ impl State {
         let per_frame_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
+                    // camera uniform
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -203,6 +206,7 @@ impl State {
                         },
                         count: None,
                     },
+                    // light uniform
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -297,24 +301,51 @@ impl State {
         )
         .unwrap();
 
-        // ---- RENDER PIPELINE ----
+        let debug_light_model = resources::load_obj_model(
+            "src/assets/octahedron.obj",
+            &device,
+            &queue,
+            &per_pass_bind_group_layout,
+        )
+        .unwrap();
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("render pipeline layout"),
-                bind_group_layouts: &[
-                    &per_frame_bind_group_layout,
-                    &per_pass_bind_group_layout,
-                    &per_object_bind_group_layout,
-                ],
-                immediate_size: 0,
-            });
+        // ---- RENDER PIPELINES ----
 
         let render_pipeline = {
+            let render_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("render pipeline layout"),
+                    bind_group_layouts: &[
+                        &per_frame_bind_group_layout,
+                        &per_pass_bind_group_layout,
+                        &per_object_bind_group_layout,
+                    ],
+                    immediate_size: 0,
+                });
+
             let shader_descriptor = wgpu::include_wgsl!("shaders/shader.wgsl");
+
             Self::create_render_pipeline(
                 &device,
                 &render_pipeline_layout,
+                surface_config.format,
+                Some(texture::Texture::DEPTH_FORMAT),
+                &[model::ModelVertex::desc()],
+                shader_descriptor,
+            )
+        };
+
+        let debug_light_render_pipeline = {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("debug light pipeline layout"),
+                bind_group_layouts: &[&per_frame_bind_group_layout],
+                immediate_size: 0,
+            });
+            let shader_descriptor = wgpu::include_wgsl!("shaders/debug_light.wgsl");
+
+            Self::create_render_pipeline(
+                &device,
+                &layout,
                 surface_config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
@@ -330,9 +361,11 @@ impl State {
             surface_config,
             is_surface_configured: true,
             render_pipeline,
+            debug_light_render_pipeline,
             camera,
             projection,
             model,
+            debug_light_model,
             per_frame_bind_group,
             per_pass_bind_group,
             per_object_bind_group,
@@ -441,8 +474,17 @@ impl State {
             render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
             render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
-            use model::DrawModel;
             render_pass.draw_model(&self.model, &self.per_frame_bind_group);
+
+
+
+            render_pass.set_pipeline(&self.debug_light_render_pipeline);
+
+            render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
+
+            render_pass.draw_model(&self.debug_light_model, &self.per_frame_bind_group);
         }
 
         // close the command encoder and submit the instructions to the gpu's render queue

@@ -26,15 +26,18 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4f,
-    @location(0) tex_coords: vec2f
+    @location(0) color: vec3f
 }
 
 @vertex
 fn vertex_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    out.clip_position = camera.view_proj * vec4f(model.position, 1.0);
-    out.tex_coords = model.tex_coords;
+    let scale = 0.25;
+    let light_model_position = model.position * scale + light.position;
+
+    out.clip_position = camera.view_proj * vec4f(light_model_position, 1.0);
+    out.color = light.color;
     return out;
 }
 
@@ -48,6 +51,5 @@ var texture_sampler: sampler;
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
-    return textureSample(texture, texture_sampler, in.tex_coords);
-    // return vec4f(1.0, 1.0, 0.0, 1.0);
+    return vec4f(in.color, 1.0);
 }
