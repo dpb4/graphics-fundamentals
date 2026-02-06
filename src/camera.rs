@@ -53,13 +53,6 @@ pub struct Camera {
     pub pitch: Rad<f32>,
 }
 
-// #[repr(C)]
-// #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-// pub struct CameraUniform {
-//     view_position: [f32; 4],
-//     view_proj: [[f32; 4]; 4],
-// }
-
 impl Camera {
     pub fn view_matrix(&self) -> Matrix4<f32> {
         let (sin_yaw, cos_yaw) = self.yaw.0.sin_cos();
@@ -145,7 +138,6 @@ impl CameraController {
     }
 
     pub fn handle_mouse(&mut self, mouse_dx: f64, mouse_dy: f64) {
-        println!("dx: {:.5} dy: {:.5}", mouse_dx, mouse_dy);
         self.amount_yaw = mouse_dx as f32;
         self.amount_pitch = mouse_dy as f32;
     }
@@ -153,14 +145,12 @@ impl CameraController {
     pub fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
         self.amount_scroll = match delta {
             MouseScrollDelta::LineDelta(_, amount) => {
-                dbg!("LINE: {}", amount);
                 amount * 100.0
             },
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition {
                 y: amount,
                 ..
             }) => {
-                dbg!("PIXEL: {}", amount);
                 *amount as f32
             }
         };
