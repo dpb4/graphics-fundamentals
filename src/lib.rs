@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::{Duration, Instant}};
 
+use cgmath::SquareMatrix;
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -20,51 +21,26 @@ mod model;
 mod resources;
 mod texture;
 
-// const VERTICES: &[Vertex] = &[
-//     Vertex {
-//         position: [-0.0868241, 0.49240386, 0.0],
-//         tex_coords: [0.4131759, 0.00759614],
-//     },
-//     Vertex {
-//         position: [-0.49513406, 0.06958647, 0.0],
-//         tex_coords: [0.0048659444, 0.43041354],
-//     },
-//     Vertex {
-//         position: [-0.21918549, -0.44939706, 0.0],
-//         tex_coords: [0.28081453, 0.949397],
-//     },
-//     Vertex {
-//         position: [0.35966998, -0.3473291, 0.0],
-//         tex_coords: [0.85967, 0.84732914],
-//     },
-//     Vertex {
-//         position: [0.44147372, 0.2347359, 0.0],
-//         tex_coords: [0.9414737, 0.2652641],
-//     },
-// ];
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    position: [f32; 4],
+    view_projection_matrix: [[f32; 4]; 4],
+}
 
-// const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4, 0];
+impl CameraUniform {
+    fn new() -> Self {
+        Self {
+            position: [0.0; 4],
+            view_projection_matrix: cgmath::Matrix4::identity().into(),
+        }
+    }
 
-// impl Vertex {
-//     fn desc() -> wgpu::VertexBufferLayout<'static> {
-//         wgpu::VertexBufferLayout {
-//             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-//             step_mode: wgpu::VertexStepMode::Vertex,
-//             attributes: &[
-//                 wgpu::VertexAttribute {
-//                     offset: 0,
-//                     shader_location: 0,
-//                     format: wgpu::VertexFormat::Float32x3,
-//                 },
-//                 wgpu::VertexAttribute {
-//                     offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-//                     shader_location: 1,
-//                     format: wgpu::VertexFormat::Float32x2,
-//                 },
-//             ],
-//         }
-//     }
-// }
+    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
+        self.position = camera.position.to_homogeneous().into();
+        self.view_projection_matrix = (projection.perspective_matrix() * camera.view_matrix()).into()
+    }
+}
 
 pub struct State {
     surface: wgpu::Surface<'static>, // the target of the rendering
@@ -73,6 +49,8 @@ pub struct State {
     device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
     queue: wgpu::Queue,   // the command queue to send things to the device
     camera: camera::Camera,
+    projection: camera::Projection,
+    camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_controller: camera::CameraController,
@@ -80,6 +58,7 @@ pub struct State {
     texture_bind_group: wgpu::BindGroup,
     model: model::Model,
     depth_texture: texture::Texture,
+    is_mouse_pressed: bool,
     window: Arc<Window>, // the actual window object
 }
 
@@ -134,6 +113,7 @@ impl State {
             .copied()
             .unwrap_or(surface_capabilities.formats[0]);
 
+        // configure the surface. this is also used later to get width/height of the screen
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -145,10 +125,15 @@ impl State {
             view_formats: vec![],
         };
 
-        let camera = camera::Camera::new(size.width as f32 / size.height as f32, 90.0);
+        let camera = camera::Camera::new([-10.0, 0.0, 0.0], cgmath::Deg(0.0), cgmath::Deg(0.0));
+        let projection = camera::Projection::new(surface_config.width, surface_config.height, 80.0, 0.1, 100.0);
+
+        let mut camera_uniform = CameraUniform::new();
+        camera_uniform.update_view_proj(&camera, &projection);
+
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
-            contents: bytemuck::cast_slice(&[camera.to_uniform()]),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -156,7 +141,7 @@ impl State {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -176,7 +161,7 @@ impl State {
             label: Some("camera_bind_group"),
         });
 
-        let camera_controller = camera::CameraController::new(0.01);
+        let camera_controller = camera::CameraController::new(10.0, 1.3);
 
         let texture_bytes = include_bytes!("assets/cat.png");
         let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
@@ -296,15 +281,20 @@ impl State {
             model,
             depth_texture,
             window,
+            projection,
+            is_mouse_pressed: false,
+            camera_uniform,
         })
     }
 
-    pub fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
+    pub fn update(&mut self, dt: Duration) {
+        // dbg!(&self.camera);
+        self.camera_controller.update_camera(&mut self.camera, dt);
+        self.camera_uniform.update_view_proj(&self.camera, &self.projection);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::cast_slice(&[self.camera.to_uniform()]),
+            bytemuck::cast_slice(&[self.camera_uniform]),
         );
     }
 
@@ -321,6 +311,8 @@ impl State {
                 &self.surface_config,
                 "depth texture",
             );
+
+            self.projection.resize(width, height);
         } else {
             log::warn!["resize was called with width 0 or height 0"]
         }
@@ -412,6 +404,17 @@ impl State {
             }
         }
     }
+
+    fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        match button {
+            MouseButton::Left => self.is_mouse_pressed = pressed,
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_scroll(&mut self, delta: &MouseScrollDelta) {
+        self.camera_controller.handle_scroll(delta);
+    }
 }
 
 pub struct App {
@@ -419,6 +422,7 @@ pub struct App {
     #[cfg(target_arch = "wasm32")]
     proxy: Option<winit::event_loop::EventLoopProxy<State>>,
     state: Option<State>,
+    last_instant: Instant,
 }
 
 impl App {
@@ -429,6 +433,7 @@ impl App {
             state: None,
             #[cfg(target_arch = "wasm32")]
             proxy,
+            last_instant: Instant::now(),
         }
     }
 }
@@ -494,6 +499,27 @@ impl ApplicationHandler<State> for App {
         self.state = Some(event);
     }
 
+    fn device_event(
+            &mut self,
+            _event_loop: &ActiveEventLoop,
+            _device_id: DeviceId,
+            event: DeviceEvent,
+        ) {
+        match &mut self.state {
+            None => { return; }
+            Some(state) => {
+                match event {
+                    DeviceEvent::MouseMotion { delta: (mouse_dx, mouse_dy) } => {
+                        if state.is_mouse_pressed {
+                            state.camera_controller.handle_mouse(mouse_dx, mouse_dy);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -509,7 +535,11 @@ impl ApplicationHandler<State> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
-                state.update();
+                let dt = self.last_instant.elapsed();
+                self.last_instant = Instant::now();
+
+                state.update(dt);
+
                 match state.render() {
                     Ok(_) => {}
                     // reconfigure the surface if it's lost or outdated
@@ -531,6 +561,14 @@ impl ApplicationHandler<State> for App {
                     },
                 ..
             } => state.handle_key(event_loop, code, key_state.is_pressed()),
+            WindowEvent::MouseInput {
+                state: button_state,
+                button,
+                ..
+            } => state.handle_mouse_button(button, button_state.is_pressed()),
+            WindowEvent::MouseWheel { delta, .. } => {
+                state.handle_mouse_scroll(&delta);
+            }
             _ => {}
         }
     }
