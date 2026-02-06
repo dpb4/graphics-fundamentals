@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use cgmath::SquareMatrix;
 use wgpu::util::DeviceExt;
@@ -16,8 +19,8 @@ use wasm_bindgen::prelude::*;
 use crate::model::Vertex;
 
 mod camera;
-mod obj_mesh;
 mod model;
+mod obj_mesh;
 mod resources;
 mod texture;
 
@@ -38,33 +41,49 @@ impl CameraUniform {
 
     fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
         self.position = camera.position.to_homogeneous().into();
-        self.view_projection_matrix = (projection.perspective_matrix() * camera.view_matrix()).into()
+        self.view_projection_matrix =
+            (projection.perspective_matrix() * camera.view_matrix()).into()
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+// padding fields are necessary because uniforms require 16 byte alignment
+struct LightUniform {
+    position: [f32; 3],
+    _padding: u32,
+    color: [f32; 3],
+    _padding2: u32,
+}
+
 pub struct State {
+    window: Arc<Window>,                        // the actual window object
+    device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
+    queue: wgpu::Queue,   // the command queue to send things to the device
     surface: wgpu::Surface<'static>, // the target of the rendering
     surface_config: wgpu::SurfaceConfiguration, // configuring the surface (size, colour format, etc)
     is_surface_configured: bool,
-    device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
-    queue: wgpu::Queue,   // the command queue to send things to the device
+    render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
     camera: camera::Camera,
     projection: camera::Projection,
+    model: model::Model,
+    per_frame_bind_group: wgpu::BindGroup, // uniforms like camera, lights, etc
+    per_pass_bind_group: wgpu::BindGroup,  // things like textures, materials, etc
+    per_object_bind_group: wgpu::BindGroup, // local things like model position or rotation, etc
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     camera_controller: camera::CameraController,
-    render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
-    texture_bind_group: wgpu::BindGroup,
-    model: model::Model,
+    light_uniform: LightUniform,
+    light_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     is_mouse_pressed: bool,
-    window: Arc<Window>, // the actual window object
 }
 
 impl State {
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
+
+        // ---- DEVICE/SURFACE CONFIG ----
 
         // an 'instance' is a handle to the gpu which can get the device (adapter) or create surfaces
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -125,11 +144,38 @@ impl State {
             view_formats: vec![],
         };
 
+        let camera_controller = camera::CameraController::new(10.0, 1.3);
+
+        // ---- HIGH LEVEL RENDER CONFIG ----
+
         let camera = camera::Camera::new([-10.0, 0.0, 0.0], cgmath::Deg(0.0), cgmath::Deg(0.0));
-        let projection = camera::Projection::new(surface_config.width, surface_config.height, 80.0, 0.1, 100.0);
+        let projection = camera::Projection::new(
+            surface_config.width,
+            surface_config.height,
+            80.0,
+            0.1,
+            100.0,
+        );
 
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
+
+        let light_uniform = LightUniform {
+            position: [5.0, 5.0, 5.0],
+            _padding: 0,
+            color: [1.0, 1.0, 1.0], // pure white
+            _padding2: 0,
+        };
+
+        let depth_texture =
+            texture::Texture::create_depth_texture(&device, &surface_config, "depth texture");
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/shader.wgsl"));
+
+        let texture_bytes = include_bytes!("assets/cat.png");
+        let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
+
+        // ---- BUFFERS ----
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
@@ -137,37 +183,43 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera_bind_group_layout"),
-            });
-
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("light buffer"),
+            contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_controller = camera::CameraController::new(10.0, 1.3);
-
-        let texture_bytes = include_bytes!("assets/cat.png");
-        let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
+        // ---- BIND GROUP LAYOUTS ----
 
         // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
-        let texture_bind_group_layout =
+        let per_frame_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("per frame bind group layout"),
+            });
+
+        let per_pass_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
                     // the texture data binding layout
@@ -189,12 +241,35 @@ impl State {
                         count: None,
                     },
                 ],
-                label: Some("texture bind group layout"),
+                label: Some("per pass bind group layout"),
             });
 
+        let per_object_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("per object bind group layout"),
+                entries: &[],
+            });
+
+        // ---- BIND GROUPS ----
+
         // bind group layouts can be be reused with various different bind groups to allow swapping the data on the fly
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
+        let per_frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &per_frame_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: light_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("camera_bind_group"),
+        });
+
+        let per_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &per_pass_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -205,20 +280,35 @@ impl State {
                     resource: wgpu::BindingResource::Sampler(&texture.sampler),
                 },
             ],
-            label: Some("texture bind group"),
+            label: Some("per pass bind group"),
         });
 
-        let depth_texture =
-            texture::Texture::create_depth_texture(&device, &surface_config, "depth texture");
+        let per_object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("per object bind group"),
+            layout: &per_object_bind_group_layout,
+            entries: &[],
+        });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/shader.wgsl"));
+        // ---- MODEL LOADING ----
 
-        let model = resources::load_obj_model("src/assets/cube.obj", &device, &queue, &texture_bind_group_layout).unwrap();
+        let model = resources::load_obj_model(
+            "src/assets/cube.obj",
+            &device,
+            &queue,
+            &per_pass_bind_group_layout,
+        )
+        .unwrap();
+
+        // ---- RENDER PIPELINE ----
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render pipeline layout"),
-                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
+                bind_group_layouts: &[
+                    &per_frame_bind_group_layout,
+                    &per_pass_bind_group_layout,
+                    &per_object_bind_group_layout,
+                ],
                 immediate_size: 0,
             });
 
@@ -267,30 +357,34 @@ impl State {
         });
 
         Ok(Self {
+            window,
+            device,
+            queue,
             surface,
             surface_config,
             is_surface_configured: true,
-            device,
-            queue,
-            camera,
-            camera_buffer,
-            camera_bind_group,
-            camera_controller,
             render_pipeline,
-            texture_bind_group,
-            model,
-            depth_texture,
-            window,
+            camera,
             projection,
-            is_mouse_pressed: false,
+            model,
+            per_frame_bind_group,
+            per_pass_bind_group,
+            per_object_bind_group,
             camera_uniform,
+            camera_buffer,
+            camera_controller,
+            light_uniform,
+            light_buffer,
+            depth_texture,
+            is_mouse_pressed: false,
         })
     }
 
     pub fn update(&mut self, dt: Duration) {
         // dbg!(&self.camera);
         self.camera_controller.update_camera(&mut self.camera, dt);
-        self.camera_uniform.update_view_proj(&self.camera, &self.projection);
+        self.camera_uniform
+            .update_view_proj(&self.camera, &self.projection);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -377,11 +471,12 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
 
-            render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
             use model::DrawModel;
-            render_pass.draw_model(&self.model, &self.camera_bind_group);
+            render_pass.draw_model(&self.model, &self.per_frame_bind_group);
             // render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             // render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
@@ -500,23 +595,25 @@ impl ApplicationHandler<State> for App {
     }
 
     fn device_event(
-            &mut self,
-            _event_loop: &ActiveEventLoop,
-            _device_id: DeviceId,
-            event: DeviceEvent,
-        ) {
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
         match &mut self.state {
-            None => { return; }
-            Some(state) => {
-                match event {
-                    DeviceEvent::MouseMotion { delta: (mouse_dx, mouse_dy) } => {
-                        if state.is_mouse_pressed {
-                            state.camera_controller.handle_mouse(mouse_dx, mouse_dy);
-                        }
-                    }
-                    _ => {}
-                }
+            None => {
+                return;
             }
+            Some(state) => match event {
+                DeviceEvent::MouseMotion {
+                    delta: (mouse_dx, mouse_dy),
+                } => {
+                    if state.is_mouse_pressed {
+                        state.camera_controller.handle_mouse(mouse_dx, mouse_dy);
+                    }
+                }
+                _ => {}
+            },
         };
     }
 
@@ -590,7 +687,7 @@ pub fn run() -> anyhow::Result<()> {
         &event_loop,
     );
 
-    log::info!("[info] yep logging is working");
+    log::info!("yep logging is working");
     event_loop.run_app(&mut app)?;
 
     Ok(())

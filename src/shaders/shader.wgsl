@@ -2,12 +2,21 @@
 // vertex shader
 
 struct Camera {
-    view_pos: vec4<f32>,
-    view_proj: mat4x4<f32>,
+    view_pos: vec4f,
+    view_proj: mat4x4f,
 }
 
-@group(1) @binding(0)
+struct Light {
+    position: vec3f,
+    _padding: u32,
+    color: vec3f,
+    _padding2: u32,
+}
+
+@group(0) @binding(0)
 var<uniform> camera: Camera;
+@group(0) @binding(1)
+var<uniform> light: Light;
 
 struct VertexInput {
     @location(0) position: vec3f,
@@ -32,9 +41,9 @@ fn vertex_main(model: VertexInput) -> VertexOutput {
 
 // fragment shader
 
-@group(0) @binding(0)
+@group(1) @binding(0)
 var texture: texture_2d<f32>;
-@group(0) @binding(1)
+@group(1) @binding(1)
 var texture_sampler: sampler;
 
 @fragment
