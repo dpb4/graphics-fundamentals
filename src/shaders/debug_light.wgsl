@@ -9,7 +9,11 @@ struct Camera {
 struct Light {
     position: vec3f,
     // implicit 4 byte padding here because vec3 is always aligned as vec4
-    color: vec3f,
+    ambient_color: vec3f,
+    // implicit 4 byte padding here because vec3 is always aligned as vec4
+    diffuse_color: vec3f,
+    // implicit 4 byte padding here because vec3 is always aligned as vec4
+    specular_color: vec3f,
     // implicit 4 byte padding here because vec3 is always aligned as vec4
 }
 
@@ -37,7 +41,7 @@ fn vertex_main(model: VertexInput) -> VertexOutput {
     let light_model_position = model.position * scale + light.position;
 
     out.clip_position = camera.view_proj * vec4f(light_model_position, 1.0);
-    out.color = light.color;
+    out.color = light.diffuse_color;
     return out;
 }
 

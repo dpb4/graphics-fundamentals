@@ -51,9 +51,13 @@ impl CameraUniform {
 // padding fields are necessary because uniforms require 16 byte alignment
 struct LightUniform {
     position: [f32; 3],
-    _padding: u32,
-    color: [f32; 3],
+    _padding1: u32,
+    ambient_color: [f32; 3],
     _padding2: u32,
+    diffuse_color: [f32; 3],
+    _padding3: u32,
+    specular_color: [f32; 3],
+    _padding4: u32,
 }
 
 pub struct State {
@@ -163,10 +167,14 @@ impl State {
         camera_uniform.update_view_proj(&camera, &projection);
 
         let light_uniform = LightUniform {
-            position: [5.0, 5.0, 5.0],
-            _padding: 0,
-            color: [1.0, 1.0, 1.0], // pure white
+            position: [5.0, 2.0, 5.0],
+            _padding1: 0,
+            ambient_color: [0.1, 0.1, 0.1],
             _padding2: 0,
+            diffuse_color: [1.0, 1.0, 1.0],
+            _padding3: 0,
+            specular_color: [1.0, 1.0, 1.0],
+            _padding4: 0,
         };
 
         let depth_texture =

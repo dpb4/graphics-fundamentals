@@ -9,7 +9,11 @@ struct Camera {
 struct Light {
     position: vec3f,
     // implicit 4 byte padding here because vec3 is always aligned as vec4
-    color: vec3f,
+    ambient_color: vec3f,
+    // implicit 4 byte padding here because vec3 is always aligned as vec4
+    diffuse_color: vec3f,
+    // implicit 4 byte padding here because vec3 is always aligned as vec4
+    specular_color: vec3f,
     // implicit 4 byte padding here because vec3 is always aligned as vec4
 }
 
@@ -26,7 +30,9 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4f,
-    @location(0) tex_coords: vec2f
+    @location(0) tex_coords: vec2f,
+    @location(1) world_normal: vec3f,
+    @location(2) world_position: vec3f,
 }
 
 @vertex
@@ -35,6 +41,8 @@ fn vertex_main(model: VertexInput) -> VertexOutput {
 
     out.clip_position = camera.view_proj * vec4f(model.position, 1.0);
     out.tex_coords = model.tex_coords;
+    out.world_normal = model.normal;
+    out.world_position = model.position;
     return out;
 }
 
@@ -48,6 +56,21 @@ var texture_sampler: sampler;
 
 @fragment
 fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
-    return textureSample(texture, texture_sampler, in.tex_coords);
-    // return vec4f(1.0, 1.0, 0.0, 1.0);
+    let light_direction = normalize(light.position - in.world_position);
+
+    let diffuse_strength = max(dot(in.world_normal, light_direction), 0.0);
+    let light_diffuse = light.diffuse_color * diffuse_strength;
+
+    let view_direction = normalize(camera.view_pos.xyz - in.world_position);
+    let reflect_direction = reflect(-light_direction, in.world_normal);
+
+    let specular_strength = pow(max(dot(view_direction, reflect_direction), 0.0), 32.0);
+    let light_specular = light.specular_color * specular_strength;
+
+    let material_diffuse_color = textureSample(texture, texture_sampler, in.tex_coords).xyz;
+
+    // let output_color = (light_specular);
+    let output_color = (light.ambient_color + light_diffuse + light_specular) * material_diffuse_color;
+
+    return vec4f(output_color, 1.0);
 }
