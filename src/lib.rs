@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::SquareMatrix;
+use cgmath::{InnerSpace, Rotation3, SquareMatrix};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -81,8 +81,10 @@ pub struct State {
     camera_controller: camera::CameraController,
     light_uniform: LightUniform,
     light_buffer: wgpu::Buffer,
+    model_transform_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     is_mouse_pressed: bool,
+    frame_count: u64,
 }
 
 impl State {
@@ -183,20 +185,6 @@ impl State {
         let texture_bytes = include_bytes!("assets/cat.png");
         let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
 
-        // ---- BUFFERS ----
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("camera buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("light buffer"),
-            contents: bytemuck::cast_slice(&[light_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
         // ---- BIND GROUP LAYOUTS ----
 
         // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
@@ -257,8 +245,37 @@ impl State {
         let per_object_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("per object bind group layout"),
-                entries: &[],
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
             });
+
+        // ---- BUFFERS ----
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("light buffer"),
+            contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let model_transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("model transform buffer"),
+            contents: bytemuck::cast_slice(&[model::ModelTransformationUniform::identity()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         // ---- BIND GROUPS ----
 
@@ -296,7 +313,10 @@ impl State {
         let per_object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("per object bind group"),
             layout: &per_object_bind_group_layout,
-            entries: &[],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: model_transform_buffer.as_entire_binding(),
+            }],
         });
 
         // ---- MODEL LOADING ----
@@ -382,8 +402,10 @@ impl State {
             camera_controller,
             light_uniform,
             light_buffer,
+            model_transform_buffer,
             depth_texture,
             is_mouse_pressed: false,
+            frame_count: 0,
         })
     }
 
@@ -397,6 +419,8 @@ impl State {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
+        
+        self.model.rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::new(1.0, -1.0, 1.0).normalize(), cgmath::Deg(self.frame_count as f32 * 0.5))
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -478,25 +502,31 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
 
+            self.queue.write_buffer(
+                &self.model_transform_buffer,
+                0,
+                bytemuck::cast_slice(&[model::ModelTransformationUniform::from_model(&self.model)]),
+            );
+
             render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
-            render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
+            // render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
+            // render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
-            render_pass.draw_model(&self.model, &self.per_frame_bind_group);
-
-
+            render_pass.draw_model(&self.model, &self.per_object_bind_group);
 
             render_pass.set_pipeline(&self.debug_light_render_pipeline);
 
-            render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
-            render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
+            // render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
+            // render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
+            // render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
             render_pass.draw_model(&self.debug_light_model, &self.per_frame_bind_group);
         }
 
         // close the command encoder and submit the instructions to the gpu's render queue
         self.queue.submit(std::iter::once(command_encoder.finish()));
+
+        self.frame_count += 1;
 
         // put the output from the rendering onto the window
         target_surface.present();

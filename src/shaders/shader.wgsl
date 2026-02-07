@@ -22,6 +22,16 @@ var<uniform> camera: Camera;
 @group(0) @binding(1)
 var<uniform> light: Light;
 
+struct ModelTransformation {
+    model_transform_col0: vec4f,
+    model_transform_col1: vec4f,
+    model_transform_col2: vec4f,
+    model_transform_col3: vec4f,
+}
+
+@group(2) @binding(0)
+var<uniform> model_transformation: ModelTransformation;
+
 struct VertexInput {
     @location(0) position: vec3f,
     @location(1) tex_coords: vec2f,
@@ -39,10 +49,19 @@ struct VertexOutput {
 fn vertex_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    out.clip_position = camera.view_proj * vec4f(model.position, 1.0);
+    let model_transformation_matrix = mat4x4(
+        model_transformation.model_transform_col0,
+        model_transformation.model_transform_col1,
+        model_transformation.model_transform_col2,
+        model_transformation.model_transform_col3
+        );
+
+    let world_position_h = model_transformation_matrix * vec4f(model.position, 1.0);
+
+    out.clip_position = camera.view_proj * world_position_h;
     out.tex_coords = model.tex_coords;
     out.world_normal = model.normal;
-    out.world_position = model.position;
+    out.world_position = world_position_h.xyz;
     return out;
 }
 

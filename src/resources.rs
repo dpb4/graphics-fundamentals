@@ -1,3 +1,4 @@
+use cgmath::One;
 use wgpu::util::DeviceExt;
 
 use crate::{model, texture};
@@ -19,43 +20,43 @@ pub fn load_texture(
     texture::Texture::from_bytes(device, queue, &data, file_name)
 }
 
-pub fn load_model_from_memory(
-    vertices: &[[f32; 3]],
-    indices: &[u32],
-    device: &wgpu::Device,
-) -> model::Model {
-    let model_verts = vertices
-        .iter()
-        .map(|v| model::ModelVertex {
-            position: *v,
-            tex_coords: [0.0; 2],
-            normal: [0.0; 3],
-        })
-        .collect::<Vec<_>>();
+// pub fn load_model_from_memory(
+//     vertices: &[[f32; 3]],
+//     indices: &[u32],
+//     device: &wgpu::Device,
+// ) -> model::Model {
+//     let model_verts = vertices
+//         .iter()
+//         .map(|v| model::ModelVertex {
+//             position: *v,
+//             tex_coords: [0.0; 2],
+//             normal: [0.0; 3],
+//         })
+//         .collect::<Vec<_>>();
 
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("memory obj vertex buffer"),
-        contents: bytemuck::cast_slice(&model_verts),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
+//     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+//         label: Some("memory obj vertex buffer"),
+//         contents: bytemuck::cast_slice(&model_verts),
+//         usage: wgpu::BufferUsages::VERTEX,
+//     });
 
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("memory obj index buffer"),
-        contents: bytemuck::cast_slice(&indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
+//     let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+//         label: Some("memory obj index buffer"),
+//         contents: bytemuck::cast_slice(&indices),
+//         usage: wgpu::BufferUsages::INDEX,
+//     });
 
-    model::Model {
-        meshes: vec![model::Mesh {
-            name: "placeholder memory mesh".to_string(),
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
-            material: 0,
-        }],
-        materials: Vec::new(),
-    }
-}
+//     model::Model {
+//         meshes: vec![model::Mesh {
+//             name: "placeholder memory mesh".to_string(),
+//             vertex_buffer,
+//             index_buffer,
+//             index_count: indices.len() as u32,
+//             material: 0,
+//         }],
+//         materials: Vec::new(),
+//     }
+// }
 
 pub fn load_obj_model(
     file_name: &str,
@@ -193,5 +194,5 @@ pub fn load_obj_model(
         })
         .collect::<Vec<_>>();
 
-    Ok(model::Model { meshes, materials })
+    Ok(model::Model { meshes, materials, position: [0.0; 3], rotation: cgmath::Quaternion::one()})
 }
