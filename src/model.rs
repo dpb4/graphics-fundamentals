@@ -1,3 +1,5 @@
+use wgpu::util::DeviceExt;
+
 use crate::texture;
 use std::ops::Range;
 pub trait Vertex {
@@ -10,6 +12,8 @@ pub struct ModelVertex {
     pub position: [f32; 3],
     pub tex_coords: [f32; 2],
     pub normal: [f32; 3],
+    pub tangent: [f32; 3],
+    pub bitangent: [f32; 3],
 }
 
 impl Vertex for ModelVertex {
@@ -33,7 +37,37 @@ impl Vertex for ModelVertex {
                     shader_location: 2,
                     format: wgpu::VertexFormat::Float32x3,
                 },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
             ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VertexDebugUniform {
+    pub position: [f32; 4],
+    pub normal: [f32; 4],
+    pub tangent: [f32; 4],
+    pub bitangent: [f32; 4],
+}
+
+impl VertexDebugUniform {
+    pub fn from_model_vertex(mv: &ModelVertex) -> Self {
+        Self {
+            position: [mv.position[0], mv.position[1], mv.position[2], 0.0],
+            normal: [mv.normal[0], mv.normal[1], mv.normal[2], 0.0],
+            tangent: [mv.tangent[0], mv.tangent[1], mv.tangent[2], 0.0],
+            bitangent: [mv.bitangent[0], mv.bitangent[1], mv.bitangent[2], 0.0],
         }
     }
 }
@@ -43,6 +77,7 @@ pub struct Model {
     pub materials: Vec<Material>,
     pub position: [f32; 3],
     pub rotation: cgmath::Quaternion<f32>,
+    pub scale: f32,
 }
 
 #[repr(C)]
@@ -65,7 +100,9 @@ impl ModelTransformationUniform {
     }
 
     pub fn from_model(model: &Model) -> Self {
-        let matrix = cgmath::Matrix4::from_translation(model.position.into()) * cgmath::Matrix4::from(model.rotation);
+        let matrix = cgmath::Matrix4::from_translation(model.position.into())
+            * cgmath::Matrix4::from(model.rotation)
+            * cgmath::Matrix4::from_scale(model.scale);
         Self {
             model_transformation_col0: matrix.x.into(),
             model_transformation_col1: matrix.y.into(),
@@ -78,7 +115,119 @@ impl ModelTransformationUniform {
 pub struct Material {
     pub name: String,
     pub diffuse_texture: texture::Texture,
+    pub normal_texture: texture::Texture,
+    pub ambient_color: [f32; 3],
+    pub diffuse_color: [f32; 3],
+    pub specular_color: [f32; 3],
     pub bind_group: wgpu::BindGroup,
+}
+
+impl Material {
+    pub fn new(
+        device: &wgpu::Device,
+        name: &str,
+        diffuse_texture: Option<texture::Texture>,
+        normal_texture: Option<texture::Texture>,
+        ambient_color: [f32; 3],
+        diffuse_color: [f32; 3],
+        specular_color: [f32; 3],
+        layout: &wgpu::BindGroupLayout,
+    ) -> Self {
+        let material_uniform = MaterialUniform::new(
+            ambient_color,
+            diffuse_color,
+            specular_color,
+            diffuse_texture.is_some(),
+            normal_texture.is_some(),
+        );
+        let material_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(name),
+            contents: bytemuck::cast_slice(&[material_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let diffuse_texture = diffuse_texture.unwrap_or(texture::Texture::dummy(
+            device,
+            &(name.to_string() + " diffuse dummy"),
+        ));
+        let normal_texture = normal_texture.unwrap_or(texture::Texture::dummy(
+            device,
+            &(name.to_string() + " normal dummy"),
+        ));
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&normal_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&normal_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: material_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some(name),
+        });
+
+        Self {
+            name: String::from(name),
+            diffuse_texture,
+            normal_texture,
+            bind_group,
+            ambient_color,
+            diffuse_color,
+            specular_color,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialUniform {
+    ambient_color: [f32; 3],
+    _padding0: u32,
+    diffuse_color: [f32; 3],
+    _padding1: u32,
+    specular_color: [f32; 3],
+    _padding2: u32,
+    has_diffuse_texture: u32,
+    has_normal_texture: u32, // these are u32 to avoid any padding confusion while using bytemuck
+    _padding3: [u32; 2],     // these are u32 to avoid any padding confusion while using bytemuck
+}
+
+impl MaterialUniform {
+    fn new(
+        ambient_color: [f32; 3],
+        diffuse_color: [f32; 3],
+        specular_color: [f32; 3],
+        has_diffuse_texture: bool,
+        has_normal_texture: bool,
+    ) -> Self {
+        Self {
+            ambient_color,
+            _padding0: 0,
+            diffuse_color,
+            _padding1: 0,
+            specular_color,
+            _padding2: 0,
+            has_diffuse_texture: if has_diffuse_texture { 1 } else { 0 },
+            has_normal_texture: if has_normal_texture { 1 } else { 0 },
+            _padding3: [0, 0],
+        }
+    }
 }
 
 pub struct Mesh {

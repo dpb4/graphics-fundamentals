@@ -145,7 +145,7 @@ impl CameraController {
     pub fn handle_scroll(&mut self, delta: &MouseScrollDelta) {
         self.amount_scroll = match delta {
             MouseScrollDelta::LineDelta(_, amount) => {
-                amount * 10.0
+                amount * 1.0
             },
             MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition {
                 y: amount,

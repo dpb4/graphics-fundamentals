@@ -69,12 +69,13 @@ pub struct State {
     is_surface_configured: bool,
     render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
     debug_light_render_pipeline: wgpu::RenderPipeline,
+    debug_polygon_render_pipeline: wgpu::RenderPipeline,
     camera: camera::Camera,
     projection: camera::Projection,
     model: model::Model,
     debug_light_model: model::Model,
     per_frame_bind_group: wgpu::BindGroup, // uniforms like camera, lights, etc
-    per_pass_bind_group: wgpu::BindGroup,  // things like textures, materials, etc
+    // per_pass_bind_group: wgpu::BindGroup,  // things like textures, materials, etc
     per_object_bind_group: wgpu::BindGroup, // local things like model position or rotation, etc
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -85,6 +86,7 @@ pub struct State {
     depth_texture: texture::Texture,
     is_mouse_pressed: bool,
     frame_count: u64,
+    enable_geometry_outline: bool,
 }
 
 impl State {
@@ -117,7 +119,7 @@ impl State {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("main_device"),
-                required_features: wgpu::Features::empty(), // allows use of specific extensions (eg float 64 support)
+                required_features: wgpu::Features::POLYGON_MODE_LINE, // allows use of specific extensions (eg float 64 support)
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 required_limits: if cfg!(target_arch = "wasm32") {
                     // sets resource limits for compatibility with different devices
@@ -156,7 +158,7 @@ impl State {
 
         // ---- HIGH LEVEL RENDER CONFIG ----
 
-        let camera = camera::Camera::new([-10.0, 0.0, 0.0], cgmath::Deg(0.0), cgmath::Deg(0.0));
+        let camera = camera::Camera::new([0.0, 0.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(0.0));
         let projection = camera::Projection::new(
             surface_config.width,
             surface_config.height,
@@ -169,9 +171,9 @@ impl State {
         camera_uniform.update_view_proj(&camera, &projection);
 
         let light_uniform = LightUniform {
-            position: [5.0, 2.0, 5.0],
+            position: [7.0, 7.0, 7.0],
             _padding1: 0,
-            ambient_color: [0.1, 0.1, 0.1],
+            ambient_color: [0.05, 0.05, 0.05],
             _padding2: 0,
             diffuse_color: [1.0, 1.0, 1.0],
             _padding3: 0,
@@ -181,9 +183,6 @@ impl State {
 
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &surface_config, "depth texture");
-
-        let texture_bytes = include_bytes!("assets/cat.png");
-        let texture = texture::Texture::from_bytes(&device, &queue, texture_bytes, "cat").unwrap();
 
         // ---- BIND GROUP LAYOUTS ----
 
@@ -220,7 +219,7 @@ impl State {
         let per_pass_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
-                    // the texture data binding layout
+                    // the diffuse texture data binding layout
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -236,6 +235,35 @@ impl State {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // the normal texture data binding layout
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    // the sampler binding layout
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // the material info
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -295,20 +323,20 @@ impl State {
             label: Some("camera_bind_group"),
         });
 
-        let per_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &per_pass_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&texture.sampler),
-                },
-            ],
-            label: Some("per pass bind group"),
-        });
+        // let per_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        //     layout: &per_pass_bind_group_layout,
+        //     entries: &[
+        //         wgpu::BindGroupEntry {
+        //             binding: 0,
+        //             resource: wgpu::BindingResource::TextureView(&texture.view),
+        //         },
+        //         wgpu::BindGroupEntry {
+        //             binding: 1,
+        //             resource: wgpu::BindingResource::Sampler(&texture.sampler),
+        //         },
+        //     ],
+        //     label: Some("per pass bind group"),
+        // });
 
         let per_object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("per object bind group"),
@@ -321,13 +349,15 @@ impl State {
 
         // ---- MODEL LOADING ----
 
-        let model = resources::load_obj_model(
-            "src/assets/cube.obj",
+        let mut model = resources::load_obj_model(
+            "src/assets/erato.obj",
             &device,
             &queue,
             &per_pass_bind_group_layout,
         )
         .unwrap();
+
+        // model.scale = 0.01;
 
         let debug_light_model = resources::load_obj_model(
             "src/assets/octahedron.obj",
@@ -336,6 +366,24 @@ impl State {
             &per_pass_bind_group_layout,
         )
         .unwrap();
+
+        // let debug_vector_model = resources::load_obj_model(
+        //     "src/assets/arrow.obj",
+        //     &device,
+        //     &queue,
+        //     &per_pass_bind_group_layout,
+        // )
+        // .unwrap();
+
+        // // TODO this only does the first mesh
+        // let vertex_debug_data = resources::load_obj_model_for_buffer("src/assets/cube.obj").unwrap();
+
+        // let vertex_debug_buffer =
+        //     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //         label: Some("model transform buffer"),
+        //         contents: bytemuck::cast_slice(&vertex_debug_data[0]),
+        //         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        //     });
 
         // ---- RENDER PIPELINES ----
 
@@ -360,6 +408,7 @@ impl State {
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
                 shader_descriptor,
+                wgpu::PolygonMode::Fill
             )
         };
 
@@ -378,6 +427,32 @@ impl State {
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
                 shader_descriptor,
+                wgpu::PolygonMode::Fill,
+            )
+        };
+
+        let debug_polygon_render_pipeline = {
+            let render_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("debug TBN layout"),
+                    bind_group_layouts: &[
+                        &per_frame_bind_group_layout,
+                        &per_pass_bind_group_layout,
+                        &per_object_bind_group_layout,
+                    ],
+                    immediate_size: 0,
+                });
+
+            let shader_descriptor = wgpu::include_wgsl!("shaders/black.wgsl");
+
+            Self::create_render_pipeline(
+                &device,
+                &render_pipeline_layout,
+                surface_config.format,
+                Some(texture::Texture::DEPTH_FORMAT),
+                &[model::ModelVertex::desc()],
+                shader_descriptor,
+                wgpu::PolygonMode::Line,
             )
         };
 
@@ -390,12 +465,13 @@ impl State {
             is_surface_configured: true,
             render_pipeline,
             debug_light_render_pipeline,
+            debug_polygon_render_pipeline,
             camera,
             projection,
             model,
             debug_light_model,
             per_frame_bind_group,
-            per_pass_bind_group,
+            // per_pass_bind_group,
             per_object_bind_group,
             camera_uniform,
             camera_buffer,
@@ -406,6 +482,7 @@ impl State {
             depth_texture,
             is_mouse_pressed: false,
             frame_count: 0,
+            enable_geometry_outline: false,
         })
     }
 
@@ -419,8 +496,21 @@ impl State {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        
-        self.model.rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::new(1.0, -1.0, 1.0).normalize(), cgmath::Deg(self.frame_count as f32 * 0.5))
+
+        self.light_uniform.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.3))
+            * cgmath::Vector3::from(self.light_uniform.position))
+        .into();
+        self.queue.write_buffer(
+            &self.light_buffer,
+            0,
+            bytemuck::cast_slice(&[self.light_uniform]),
+        );
+        // self.model.rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::new(1.0, -1.0, 1.0).normalize(), cgmath::Deg(self.frame_count as f32 * 0.05))
+        self.model.rotation = cgmath::Quaternion::from_axis_angle(
+            cgmath::Vector3::unit_y(),
+            cgmath::Deg(self.frame_count as f32 * 0.02),
+        );
+        // self.model.position = [-5.0, -5.0, 0.0];
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -521,6 +611,11 @@ impl State {
             // render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
             render_pass.draw_model(&self.debug_light_model, &self.per_frame_bind_group);
+
+            if self.enable_geometry_outline {
+                render_pass.set_pipeline(&self.debug_polygon_render_pipeline);
+                render_pass.draw_model(&self.model, &self.per_object_bind_group);
+            }
         }
 
         // close the command encoder and submit the instructions to the gpu's render queue
@@ -536,6 +631,7 @@ impl State {
     pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
+            (KeyCode::KeyG, true) => self.enable_geometry_outline = !self.enable_geometry_outline,
             _ => {
                 self.camera_controller.handle_key(code, is_pressed);
             }
@@ -560,6 +656,7 @@ impl State {
         depth_format: Option<wgpu::TextureFormat>,
         vertex_layouts: &[wgpu::VertexBufferLayout],
         shader_descriptor: wgpu::ShaderModuleDescriptor,
+        polygon_mode: wgpu::PolygonMode,
     ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(shader_descriptor);
 
@@ -591,7 +688,7 @@ impl State {
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
                 // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-                polygon_mode: wgpu::PolygonMode::Fill,
+                polygon_mode,
                 // true requires Features::DEPTH_CLIP_CONTROL
                 unclipped_depth: false,
                 // true requires Features::CONSERVATIVE_RASTERIZATION
