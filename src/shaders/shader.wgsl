@@ -1,6 +1,11 @@
 
 // vertex shader
 
+// TODO add to shader:
+// - timestep or framecounter
+// - performance tracking
+// 
+
 struct Camera {
     view_pos: vec4f,
     view_proj: mat4x4f,
@@ -41,9 +46,9 @@ struct VertexOutput {
     @location(0) tex_coords: vec2f,
     @location(1) world_normal: vec3f,
     @location(2) world_position: vec3f,
-    @location(3) tangent_position: vec3f,
-    @location(4) tangent_light_position: vec3f,
-    @location(5) tangent_view_position: vec3f,
+    @location(3) tangent_light_direction: vec3f,
+    @location(4) tangent_view_direction: vec3f,
+    @location(5) tangent_half_direction: vec3f,
 }
 
 @vertex
@@ -72,9 +77,15 @@ fn vertex_main(vertex: VertexInput) -> VertexOutput {
     out.tex_coords = vertex.tex_coords;
     out.world_normal   = world_normal;
     out.world_position = world_position_h.xyz;
-    out.tangent_position       = tangent_transformation_matrix * world_position_h.xyz;
-    out.tangent_view_position  = tangent_transformation_matrix * camera.view_pos.xyz;
-    out.tangent_light_position = tangent_transformation_matrix * light.position;
+
+
+    let light_direction = light.position - world_position_h.xyz;
+    let view_direction = camera.view_pos.xyz - world_position_h.xyz;
+    let half_direction = (light_direction + view_direction) * 0.5;
+
+    out.tangent_light_direction = normalize(tangent_transformation_matrix * light_direction);
+    out.tangent_view_direction = normalize(tangent_transformation_matrix * view_direction);
+    out.tangent_half_direction = normalize(tangent_transformation_matrix * half_direction);
     // out.tangent_position       = world_normal;
     // out.tangent_view_position  = vertex.tangent;
     // out.tangent_light_position = world_bitangent;
@@ -121,31 +132,33 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
     var material_normal: vec3f;
 
     if material.has_normal_texture == 1{
-        material_normal = textureSample(normal_texture, normal_sampler, in.tex_coords).xyz;
+        material_normal = textureSample(normal_texture, normal_sampler, in.tex_coords).xyz * 2.0 - 1;
     } else {
         material_normal = vec3f(0.0, 0.0, 1.0);
     }
 
     // lighting vectors:
     // let tangent_normal = material_normal.xyz * 2.0 - 1.0; // map from [0, 1] to [-1, 1]
-    let tangent_normal = normalize(material_normal.xyz);
-    let light_direction = normalize(in.tangent_light_position - in.tangent_position); // vector from point to light (in tangent space)
-    let view_direction = normalize(in.tangent_view_position - in.tangent_position); // vector from point to eye (in tangent space)
-    let half_direction = normalize(view_direction + light_direction);
-    let reflect_direction = reflect(-light_direction, view_direction);
+    let normal = normalize(material_normal.xyz);
+    // let light_direction = normalize(in.tangent_light_position - in.tangent_position); // vector from point to light (in tangent space)
+    let light_direction = in.tangent_light_direction; 
+    let view_direction = in.tangent_view_direction; 
+    let half_direction = in.tangent_half_direction; 
+
+    // let reflect_direction = normalize(reflect(-light_direction, view_direction));
 
 
-    let diffuse_strength = max(dot(tangent_normal, light_direction), 0.0);
+    let diffuse_strength = max(dot(normal, light_direction), 0.0);
     let light_diffuse = light.diffuse_color * diffuse_strength;
 
-    // let reflect_direction = reflect(-light_direction, tangent_normal);
+    // let reflect_direction = reflect(-light_direction, normal);
     // let specular_strength = pow(max(dot(view_direction, reflect_direction), 0.0), 128.0); // just phong
-    let specular_strength = pow(max(dot(tangent_normal, half_direction), 0.0), 32.0); // blinn phong
-    // let specular_strength = 0.0;
+    let specular_strength = pow(max(dot(normal, half_direction), 0.0), 32.0); // blinn phong
     let light_specular = light.specular_color * specular_strength;
+    // let specular_strength = 0.0;
 
-    // let angle = (dot(tangent_normal, half_direction) + 1.0) * 0.5;
-    // let angle = dot(tangent_normal, half_direction);
+    let angle = (dot(normal, half_direction) + 1.0) * 0.5;
+    // let angle = dot(normal, half_direction);
     // let angle = length(in.tangent_view_position);
     // let angle = dot(view_direction, reflect_direction);
     // let angle = (dot(in.view, half_direction) + 1.0) * 0.5;
@@ -153,9 +166,10 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
     // let output_color = (light_specular);
 
     let output_color = (light.ambient_color + light_diffuse + light_specular) * material_diffuse_color;
-    // var output_color = vec3f(angle, 1.0, 1.0 - angle);
+    // let output_color = (light_diffuse) * material_diffuse_color;
+    // var output_color = vec3f(specular_strength, 0.0, 1.0 - specular_strength);
 
-    // if length(tangent_normal) < 0.5 {
+    // if length(normal) < 0.5 {
     //     output_color = vec3f(0.0, 1.0, 0.0);
     // }
 

@@ -87,6 +87,22 @@ pub struct State {
     is_mouse_pressed: bool,
     frame_count: u64,
     enable_geometry_outline: bool,
+    debug_tbn_extras: DebugTBNStateExtras,
+}
+
+struct DebugTBNStateExtras {
+    tangent_bind_group: wgpu::BindGroup,
+    bitangent_bind_group: wgpu::BindGroup,
+    normal_bind_group: wgpu::BindGroup,
+    tangent_material: model::Material,
+    bitangent_material: model::Material,
+    normal_material: model::Material,
+    debug_tbn_render_pipeline: wgpu::RenderPipeline,
+    debug_tbn_uniforms: [Vec<model::VectorDebugUniform>; 3],
+    debug_tangent_buffer: wgpu::Buffer,
+    debug_bitangent_buffer: wgpu::Buffer,
+    debug_normal_buffer: wgpu::Buffer,
+    debug_vector_model: model::Model,
 }
 
 impl State {
@@ -156,19 +172,10 @@ impl State {
 
         let camera_controller = camera::CameraController::new(10.0, 1.3);
 
+        let (camera, projection, camera_uniform, camera_buffer) =
+            Self::create_camera(&device, &surface_config);
+
         // ---- HIGH LEVEL RENDER CONFIG ----
-
-        let camera = camera::Camera::new([0.0, 0.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(0.0));
-        let projection = camera::Projection::new(
-            surface_config.width,
-            surface_config.height,
-            80.0,
-            0.1,
-            100.0,
-        );
-
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
 
         let light_uniform = LightUniform {
             position: [7.0, 7.0, 7.0],
@@ -187,111 +194,11 @@ impl State {
         // ---- BIND GROUP LAYOUTS ----
 
         // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
-        let per_frame_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    // camera uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // light uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-                label: Some("per frame bind group layout"),
-            });
 
-        let per_pass_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    // the diffuse texture data binding layout
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    // the sampler binding layout
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // the normal texture data binding layout
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    // the sampler binding layout
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // the material info
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-                label: Some("per pass bind group layout"),
-            });
-
-        let per_object_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("per object bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let (per_frame_bind_group_layout, per_pass_bind_group_layout, per_object_bind_group_layout) =
+            Self::create_bind_group_layouts(&device);
 
         // ---- BUFFERS ----
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("camera buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
 
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light buffer"),
@@ -323,20 +230,7 @@ impl State {
             label: Some("camera_bind_group"),
         });
 
-        // let per_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        //     layout: &per_pass_bind_group_layout,
-        //     entries: &[
-        //         wgpu::BindGroupEntry {
-        //             binding: 0,
-        //             resource: wgpu::BindingResource::TextureView(&texture.view),
-        //         },
-        //         wgpu::BindGroupEntry {
-        //             binding: 1,
-        //             resource: wgpu::BindingResource::Sampler(&texture.sampler),
-        //         },
-        //     ],
-        //     label: Some("per pass bind group"),
-        // });
+        // the per pass bind group is created by materials
 
         let per_object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("per object bind group"),
@@ -350,14 +244,14 @@ impl State {
         // ---- MODEL LOADING ----
 
         let mut model = resources::load_obj_model(
-            "src/assets/cube-tex.obj",
+            "src/assets/bs_rest.obj",
             &device,
             &queue,
             &per_pass_bind_group_layout,
         )
         .unwrap();
 
-        model.scale = 1.1;
+        model.scale = 5.0;
 
         let debug_light_model = resources::load_obj_model(
             "src/assets/octahedron.obj",
@@ -366,24 +260,6 @@ impl State {
             &per_pass_bind_group_layout,
         )
         .unwrap();
-
-        // let debug_vector_model = resources::load_obj_model(
-        //     "src/assets/arrow.obj",
-        //     &device,
-        //     &queue,
-        //     &per_pass_bind_group_layout,
-        // )
-        // .unwrap();
-
-        // // TODO this only does the first mesh
-        // let vertex_debug_data = resources::load_obj_model_for_buffer("src/assets/cube.obj").unwrap();
-
-        // let vertex_debug_buffer =
-        //     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        //         label: Some("model transform buffer"),
-        //         contents: bytemuck::cast_slice(&vertex_debug_data[0]),
-        //         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        //     });
 
         // ---- RENDER PIPELINES ----
 
@@ -434,7 +310,7 @@ impl State {
         let debug_polygon_render_pipeline = {
             let render_pipeline_layout =
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("debug TBN layout"),
+                    label: Some("debug polygon layout"),
                     bind_group_layouts: &[
                         &per_frame_bind_group_layout,
                         &per_pass_bind_group_layout,
@@ -455,6 +331,16 @@ impl State {
                 wgpu::PolygonMode::Line,
             )
         };
+
+        let debug_tbn_extras = Self::create_debug_extras(
+            &device,
+            &queue,
+            &surface_config,
+            &model,
+            &model_transform_buffer,
+            per_frame_bind_group_layout,
+            per_pass_bind_group_layout,
+        );
 
         Ok(Self {
             window,
@@ -483,7 +369,317 @@ impl State {
             is_mouse_pressed: false,
             frame_count: 0,
             enable_geometry_outline: false,
+            debug_tbn_extras,
         })
+    }
+
+    fn create_camera(
+        device: &wgpu::Device,
+        surface_config: &wgpu::SurfaceConfiguration,
+    ) -> (
+        camera::Camera,
+        camera::Projection,
+        CameraUniform,
+        wgpu::Buffer,
+    ) {
+        let camera = camera::Camera::new([0.0, 0.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(0.0));
+        let projection = camera::Projection::new(
+            surface_config.width,
+            surface_config.height,
+            80.0,
+            0.1,
+            100.0,
+        );
+
+        let mut camera_uniform = CameraUniform::new();
+        camera_uniform.update_view_proj(&camera, &projection);
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        (camera, projection, camera_uniform, camera_buffer)
+    }
+
+    fn create_bind_group_layouts(
+        device: &wgpu::Device,
+    ) -> (
+        wgpu::BindGroupLayout,
+        wgpu::BindGroupLayout,
+        wgpu::BindGroupLayout,
+    ) {
+        let per_frame = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                // camera uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // light uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("per frame bind group layout"),
+        });
+
+        let per_pass = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                // the diffuse texture data binding layout
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // the sampler binding layout
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // the normal texture data binding layout
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // the sampler binding layout
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // the material info
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("per pass bind group layout"),
+        });
+
+        let per_object = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("per object bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        (per_frame, per_pass, per_object)
+    }
+
+    fn create_debug_extras(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_config: &wgpu::SurfaceConfiguration,
+        model: &model::Model,
+        model_transform_buffer: &wgpu::Buffer,
+        per_frame_bind_group_layout: wgpu::BindGroupLayout,
+        per_pass_bind_group_layout: wgpu::BindGroupLayout,
+    ) -> DebugTBNStateExtras {
+        let per_object_debug_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("debug TBN per object bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let debug_tbn_uniforms = model::VectorDebugUniform::from_mesh_tbn(&model.meshes[0]);
+
+        let debug_tangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug TBN buffer"),
+            contents: bytemuck::cast_slice(&debug_tbn_uniforms[0][..]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let debug_bitangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug TBN buffer"),
+            contents: bytemuck::cast_slice(&debug_tbn_uniforms[1][..]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let debug_normal_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("debug TBN buffer"),
+            contents: bytemuck::cast_slice(&debug_tbn_uniforms[2][..]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let tangent_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("debug tbn tangent bind group"),
+            layout: &per_object_debug_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: model_transform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: debug_tangent_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bitangent_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("debug tbn bitangent bind group"),
+            layout: &per_object_debug_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: model_transform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: debug_bitangent_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let normal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("debug tbn normal bind group"),
+            layout: &per_object_debug_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: model_transform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: debug_normal_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let debug_vector_model = resources::load_obj_model(
+            "src/assets/arrow.obj",
+            &device,
+            &queue,
+            &per_pass_bind_group_layout,
+        )
+        .unwrap();
+
+        let tangent_material = resources::load_material(
+            "src/assets/all_materials.mtl",
+            "blue",
+            &device,
+            &per_pass_bind_group_layout,
+            &queue,
+        );
+
+        let bitangent_material = resources::load_material(
+            "src/assets/all_materials.mtl",
+            "green",
+            &device,
+            &per_pass_bind_group_layout,
+            &queue,
+        );
+
+        let normal_material = resources::load_material(
+            "src/assets/all_materials.mtl",
+            "red",
+            &device,
+            &per_pass_bind_group_layout,
+            &queue,
+        );
+
+        let debug_tbn_render_pipeline = {
+            let render_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("debug TBN layout"),
+                    bind_group_layouts: &[
+                        &per_frame_bind_group_layout,
+                        &per_pass_bind_group_layout,
+                        &per_object_debug_bind_group_layout,
+                    ],
+                    immediate_size: 0,
+                });
+
+            let shader_descriptor = wgpu::include_wgsl!("shaders/debug_vector.wgsl");
+
+            Self::create_render_pipeline(
+                &device,
+                &render_pipeline_layout,
+                surface_config.format,
+                Some(texture::Texture::DEPTH_FORMAT),
+                &[model::ModelVertex::desc()],
+                shader_descriptor,
+                wgpu::PolygonMode::Fill,
+            )
+        };
+
+        DebugTBNStateExtras {
+            tangent_bind_group,
+            bitangent_bind_group,
+            normal_bind_group,
+            tangent_material,
+            bitangent_material,
+            normal_material,
+            debug_tbn_render_pipeline,
+            debug_tbn_uniforms,
+            debug_tangent_buffer,
+            debug_bitangent_buffer,
+            debug_normal_buffer,
+            debug_vector_model,
+        }
     }
 
     pub fn update(&mut self, dt: Duration) {
@@ -615,6 +811,26 @@ impl State {
             if self.enable_geometry_outline {
                 render_pass.set_pipeline(&self.debug_polygon_render_pipeline);
                 render_pass.draw_model(&self.model, &self.per_object_bind_group);
+
+                render_pass.set_pipeline(&self.debug_tbn_extras.debug_tbn_render_pipeline);
+                render_pass.draw_mesh_instanced(
+                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
+                    &self.debug_tbn_extras.tangent_material,
+                    0..(self.debug_tbn_extras.debug_tbn_uniforms[0].len() as u32),
+                    &self.debug_tbn_extras.tangent_bind_group,
+                );
+                render_pass.draw_mesh_instanced(
+                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
+                    &self.debug_tbn_extras.bitangent_material,
+                    0..(self.debug_tbn_extras.debug_tbn_uniforms[1].len() as u32),
+                    &self.debug_tbn_extras.bitangent_bind_group,
+                );
+                render_pass.draw_mesh_instanced(
+                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
+                    &self.debug_tbn_extras.normal_material,
+                    0..(self.debug_tbn_extras.debug_tbn_uniforms[2].len() as u32),
+                    &self.debug_tbn_extras.normal_bind_group,
+                );
             }
         }
 

@@ -3,6 +3,9 @@ use wgpu::util::DeviceExt;
 
 use crate::texture;
 use std::ops::Range;
+
+const DET_EPSILON: f32 = 0.0001;
+
 pub trait Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static>;
 }
@@ -55,21 +58,41 @@ impl Vertex for ModelVertex {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct VertexDebugUniform {
+pub struct VectorDebugUniform {
     pub position: [f32; 4],
-    pub normal: [f32; 4],
-    pub tangent: [f32; 4],
-    pub bitangent: [f32; 4],
+    pub vector: [f32; 4],
 }
 
-impl VertexDebugUniform {
-    pub fn from_model_vertex(mv: &ModelVertex) -> Self {
-        Self {
-            position: [mv.position[0], mv.position[1], mv.position[2], 0.0],
-            normal: [mv.normal[0], mv.normal[1], mv.normal[2], 0.0],
-            tangent: [mv.tangent[0], mv.tangent[1], mv.tangent[2], 0.0],
-            bitangent: [mv.bitangent[0], mv.bitangent[1], mv.bitangent[2], 0.0],
-        }
+impl VectorDebugUniform {
+    pub fn from_mesh_tbn(m: &Mesh) -> [Vec<VectorDebugUniform>; 3] {
+        let tangents = m.verts.iter().map(|v| {
+            let [px, py, pz] = v.position;
+            let [tx, ty, tz] = v.tangent;
+            Self {
+                position: [px, py, pz, 1.0],
+                vector: [tx, ty, tz, 1.0],
+            }
+        }).collect();
+
+        let bitangents = m.verts.iter().map(|v| {
+            let [px, py, pz] = v.position;
+            let [bx, by, bz] = v.bitangent;
+            Self {
+                position: [px, py, pz, 1.0],
+                vector: [bx, by, bz, 1.0],
+            }
+        }).collect();
+
+        let normals = m.verts.iter().map(|v| {
+            let [px, py, pz] = v.position;
+            let [nx, ny, nz] = v.normal;
+            Self {
+                position: [px, py, pz, 1.0],
+                vector: [nx, ny, nz, 1.0],
+            }
+        }).collect();
+
+        [tangents, bitangents, normals]
     }
 }
 
@@ -209,7 +232,6 @@ pub struct MaterialUniform {
     _padding3: [u32; 2],
 }
 
-const DET_EPSILON: f32 = 0.0001;
 
 impl MaterialUniform {
     fn new(
@@ -235,6 +257,7 @@ impl MaterialUniform {
 
 pub struct Mesh {
     pub name: String,
+    pub verts: Vec<ModelVertex>,
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
@@ -322,6 +345,7 @@ impl Mesh {
         log::info!("loaded mesh: {}", name);
         Self {
             name,
+            verts,
             vertex_buffer,
             index_buffer,
             index_count: inds.len() as u32,

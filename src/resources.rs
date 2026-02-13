@@ -23,6 +23,42 @@ pub fn load_texture(
     texture::Texture::from_bytes(device, queue, &data, file_name, is_linear)
 }
 
+pub fn load_material(
+    mtllib_name: &str,
+    material_name: &str,
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    queue: &wgpu::Queue,
+) -> model::Material {
+    let (tm_vec, tm_map) = tobj::load_mtl(mtllib_name).unwrap();
+
+    let tm = tm_vec
+        .into_iter()
+        .nth(*tm_map.get(&material_name.to_string()).unwrap())
+        .unwrap();
+
+    let diffuse_texture = tm
+        .diffuse_texture
+        .as_ref()
+        .and_then(|dtn| load_texture(&format!("src/assets/{}", dtn), device, queue, false).ok());
+
+    let normal_texture = tm
+        .normal_texture
+        .as_ref()
+        .and_then(|dtn| load_texture(&format!("src/assets/{}", dtn), device, queue, true).ok());
+
+    model::Material::new(
+        device,
+        &tm.name,
+        diffuse_texture,
+        normal_texture,
+        tm.ambient.unwrap_or([0.0; 3]),
+        tm.diffuse.unwrap_or([1.0, 0.0, 1.0]),
+        tm.specular.unwrap_or([1.0; 3]),
+        layout,
+    )
+}
+
 pub fn load_obj_model(
     file_name: &str,
     device: &wgpu::Device,
