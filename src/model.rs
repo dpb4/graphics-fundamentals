@@ -1,3 +1,4 @@
+use cgmath::InnerSpace;
 use wgpu::util::DeviceExt;
 
 use crate::texture;
@@ -203,10 +204,12 @@ pub struct MaterialUniform {
     _padding1: u32,
     specular_color: [f32; 3],
     _padding2: u32,
-    has_diffuse_texture: u32,
-    has_normal_texture: u32, // these are u32 to avoid any padding confusion while using bytemuck
-    _padding3: [u32; 2],     // these are u32 to avoid any padding confusion while using bytemuck
+    has_diffuse_texture: u32, // these are u32 to avoid any padding confusion while using bytemuck
+    has_normal_texture: u32,  // these are u32 to avoid any padding confusion while using bytemuck
+    _padding3: [u32; 2],
 }
+
+const DET_EPSILON: f32 = 0.0001;
 
 impl MaterialUniform {
     fn new(
@@ -236,6 +239,95 @@ pub struct Mesh {
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
     pub material: usize,
+}
+
+impl Mesh {
+    pub fn from_verts_inds(device: &wgpu::Device, name: String, mut verts: Vec<ModelVertex>, inds: Vec<u32>, material: usize) -> Self {
+        assert!(
+            inds.len() % 3 == 0,
+            "indices are not a multiple of 3, cannot load model"
+        );
+
+        // source for this: https://terathon.com/blog/tangent-space.html
+
+        for ti in inds.chunks(3) {
+            let v0 = verts[ti[0] as usize];
+            let v1 = verts[ti[1] as usize];
+            let v2 = verts[ti[2] as usize];
+
+            let pos0 = cgmath::Vector3::from(v0.position);
+            let pos1 = cgmath::Vector3::from(v1.position);
+            let pos2 = cgmath::Vector3::from(v2.position);
+
+            let uv0 = cgmath::Vector2::from(v0.tex_coords);
+            let uv1 = cgmath::Vector2::from(v1.tex_coords);
+            let uv2 = cgmath::Vector2::from(v2.tex_coords);
+
+            let delta_pos_0_1 = pos1 - pos0;
+            let delta_pos_0_2 = pos2 - pos0;
+
+            let delta_uv_0_1 = uv1 - uv0;
+            let delta_uv_0_2 = uv2 - uv0;
+
+            let det_denom = delta_uv_0_1.x * delta_uv_0_2.y - delta_uv_0_1.y * delta_uv_0_2.x;
+
+            let tangent = if det_denom.abs() <= DET_EPSILON {
+                // in this case the triangle is degenerate somehow; same UVs, 0 UVs, idk but it needs to be fixed
+                // pick an arbitrary vector which isn't parallel to the normal
+                let normal = cgmath::Vector3::from(v0.normal);
+                let arb = if normal.z.abs() < 0.999 {
+                    cgmath::Vector3::unit_z()
+                } else {
+                    cgmath::Vector3::unit_y()
+                };
+
+                arb.cross(normal).normalize()
+            } else {
+                (delta_pos_0_1 * delta_uv_0_2.y - delta_pos_0_2 * delta_uv_0_1.y) / det_denom
+            };
+
+            // each vertex in the triangle uses the same tangent/bitangent
+            // note the addition instead of assignment, because multiple faces
+            // could be calculating different T/Bs, hence the need for the average
+            verts[ti[0] as usize].tangent =
+                (tangent + cgmath::Vector3::from(verts[ti[0] as usize].tangent)).into();
+            verts[ti[1] as usize].tangent =
+                (tangent + cgmath::Vector3::from(verts[ti[1] as usize].tangent)).into();
+            verts[ti[2] as usize].tangent =
+                (tangent + cgmath::Vector3::from(verts[ti[2] as usize].tangent)).into();
+        }
+
+        for v in verts.iter_mut() {
+            let vn = cgmath::Vector3::from(v.normal);
+            let vt = cgmath::Vector3::from(v.tangent);
+
+            // use gram schmidt process to orthogonalize the tangent vec
+            let tangent_gs = (vt - (vn * vn.dot(vt))).normalize();
+            v.tangent = tangent_gs.into();
+            v.bitangent = tangent_gs.cross(-vn).normalize().into();
+        }
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&(name.clone() + " vertex buffer")),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&(name.clone() + " index buffer")),
+            contents: bytemuck::cast_slice(&inds),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        log::info!("loaded mesh: {}", name);
+        Self {
+            name,
+            vertex_buffer,
+            index_buffer,
+            index_count: inds.len() as u32,
+            material,
+        }
+    }
 }
 
 pub trait DrawModel<'a> {

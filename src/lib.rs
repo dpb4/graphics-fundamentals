@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::{InnerSpace, Rotation3, SquareMatrix};
+use cgmath::{Rotation3, SquareMatrix};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -350,14 +350,14 @@ impl State {
         // ---- MODEL LOADING ----
 
         let mut model = resources::load_obj_model(
-            "src/assets/erato.obj",
+            "src/assets/cube-tex.obj",
             &device,
             &queue,
             &per_pass_bind_group_layout,
         )
         .unwrap();
 
-        // model.scale = 0.01;
+        model.scale = 1.1;
 
         let debug_light_model = resources::load_obj_model(
             "src/assets/octahedron.obj",
@@ -408,7 +408,7 @@ impl State {
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
                 shader_descriptor,
-                wgpu::PolygonMode::Fill
+                wgpu::PolygonMode::Fill,
             )
         };
 
@@ -497,19 +497,19 @@ impl State {
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
 
-        self.light_uniform.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.3))
-            * cgmath::Vector3::from(self.light_uniform.position))
-        .into();
+        // self.light_uniform.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.3))
+        //     * cgmath::Vector3::from(self.light_uniform.position))
+        // .into();
         self.queue.write_buffer(
             &self.light_buffer,
             0,
             bytemuck::cast_slice(&[self.light_uniform]),
         );
         // self.model.rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::new(1.0, -1.0, 1.0).normalize(), cgmath::Deg(self.frame_count as f32 * 0.05))
-        self.model.rotation = cgmath::Quaternion::from_axis_angle(
-            cgmath::Vector3::unit_y(),
-            cgmath::Deg(self.frame_count as f32 * 0.02),
-        );
+        // self.model.rotation = cgmath::Quaternion::from_axis_angle(
+        //     cgmath::Vector3::unit_y(),
+        //     cgmath::Deg(self.frame_count as f32 * 0.02),
+        // );
         // self.model.position = [-5.0, -5.0, 0.0];
     }
 
@@ -632,6 +632,12 @@ impl State {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
             (KeyCode::KeyG, true) => self.enable_geometry_outline = !self.enable_geometry_outline,
+            (KeyCode::KeyR, true) => {
+                self.model.rotation = cgmath::Quaternion::from_axis_angle(
+                    cgmath::Vector3::unit_y(),
+                    cgmath::Deg(self.frame_count as f32 * 0.1),
+                )
+            }
             _ => {
                 self.camera_controller.handle_key(code, is_pressed);
             }
@@ -736,7 +742,8 @@ impl App {
 impl ApplicationHandler<State> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[allow(unused_mut)]
-        let mut window_attributes = Window::default_attributes();
+        let mut window_attributes =
+            winit::window::WindowAttributes::default().with_title("graphics fundamentals - dpb4");
 
         #[cfg(target_arch = "wasm32")]
         {
