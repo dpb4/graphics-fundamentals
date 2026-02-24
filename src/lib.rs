@@ -21,7 +21,6 @@ use crate::model::{DrawModel, Vertex};
 
 mod camera;
 mod model;
-mod obj_mesh;
 mod obj_parse;
 mod resources;
 mod texture;
