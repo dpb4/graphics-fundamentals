@@ -4,7 +4,7 @@ use wgpu::util::DeviceExt;
 use crate::texture;
 use std::ops::Range;
 
-const DET_EPSILON: f32 = 0.0001;
+const DET_EPSILON: f32 = 0.00000001;
 
 pub trait Vertex {
     fn desc() -> wgpu::VertexBufferLayout<'static>;
@@ -65,32 +65,44 @@ pub struct VectorDebugUniform {
 
 impl VectorDebugUniform {
     pub fn from_mesh_tbn(m: &Mesh) -> [Vec<VectorDebugUniform>; 3] {
-        let tangents = m.verts.iter().map(|v| {
-            let [px, py, pz] = v.position;
-            let [tx, ty, tz] = v.tangent;
-            Self {
-                position: [px, py, pz, 1.0],
-                vector: [tx, ty, tz, 1.0],
-            }
-        }).collect();
+        let tangents = m
+            .verts
+            .iter()
+            .map(|v| {
+                let [px, py, pz] = v.position;
+                let [tx, ty, tz] = v.tangent;
+                Self {
+                    position: [px, py, pz, 1.0],
+                    vector: [tx, ty, tz, 1.0],
+                }
+            })
+            .collect();
 
-        let bitangents = m.verts.iter().map(|v| {
-            let [px, py, pz] = v.position;
-            let [bx, by, bz] = v.bitangent;
-            Self {
-                position: [px, py, pz, 1.0],
-                vector: [bx, by, bz, 1.0],
-            }
-        }).collect();
+        let bitangents = m
+            .verts
+            .iter()
+            .map(|v| {
+                let [px, py, pz] = v.position;
+                let [bx, by, bz] = v.bitangent;
+                Self {
+                    position: [px, py, pz, 1.0],
+                    vector: [bx, by, bz, 1.0],
+                }
+            })
+            .collect();
 
-        let normals = m.verts.iter().map(|v| {
-            let [px, py, pz] = v.position;
-            let [nx, ny, nz] = v.normal;
-            Self {
-                position: [px, py, pz, 1.0],
-                vector: [nx, ny, nz, 1.0],
-            }
-        }).collect();
+        let normals = m
+            .verts
+            .iter()
+            .map(|v| {
+                let [px, py, pz] = v.position;
+                let [nx, ny, nz] = v.normal;
+                Self {
+                    position: [px, py, pz, 1.0],
+                    vector: [nx, ny, nz, 1.0],
+                }
+            })
+            .collect();
 
         [tangents, bitangents, normals]
     }
@@ -98,7 +110,6 @@ impl VectorDebugUniform {
 
 pub struct Model {
     pub meshes: Vec<Mesh>,
-    pub materials: Vec<Material>,
     pub position: [f32; 3],
     pub rotation: cgmath::Quaternion<f32>,
     pub scale: f32,
@@ -232,7 +243,6 @@ pub struct MaterialUniform {
     _padding3: [u32; 2],
 }
 
-
 impl MaterialUniform {
     fn new(
         ambient_color: [f32; 3],
@@ -265,11 +275,20 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    pub fn from_verts_inds(device: &wgpu::Device, name: String, mut verts: Vec<ModelVertex>, inds: Vec<u32>, material: usize) -> Self {
+    pub fn from_verts_inds(
+        device: &wgpu::Device,
+        name: String,
+        mut verts: Vec<ModelVertex>,
+        inds: Vec<u32>,
+        material: usize,
+    ) -> Self {
         assert!(
             inds.len() % 3 == 0,
             "indices are not a multiple of 3, cannot load model"
         );
+
+        let mut arb_counter = 0;
+        let mut usual_counter = 0;
 
         // source for this: https://terathon.com/blog/tangent-space.html
 
@@ -304,21 +323,32 @@ impl Mesh {
                     cgmath::Vector3::unit_y()
                 };
 
+                arb_counter += 1;
                 arb.cross(normal).normalize()
             } else {
+                usual_counter += 1;
                 (delta_pos_0_1 * delta_uv_0_2.y - delta_pos_0_2 * delta_uv_0_1.y) / det_denom
             };
+            let area = delta_pos_0_1.cross(delta_pos_0_2).magnitude();
+            let weighted_tangent = tangent * area;
 
             // each vertex in the triangle uses the same tangent/bitangent
             // note the addition instead of assignment, because multiple faces
             // could be calculating different T/Bs, hence the need for the average
             verts[ti[0] as usize].tangent =
-                (tangent + cgmath::Vector3::from(verts[ti[0] as usize].tangent)).into();
+                (weighted_tangent + cgmath::Vector3::from(verts[ti[0] as usize].tangent)).into();
             verts[ti[1] as usize].tangent =
-                (tangent + cgmath::Vector3::from(verts[ti[1] as usize].tangent)).into();
+                (weighted_tangent + cgmath::Vector3::from(verts[ti[1] as usize].tangent)).into();
             verts[ti[2] as usize].tangent =
-                (tangent + cgmath::Vector3::from(verts[ti[2] as usize].tangent)).into();
+                (weighted_tangent + cgmath::Vector3::from(verts[ti[2] as usize].tangent)).into();
         }
+
+        println!(
+            "arb: {} usual: {} ratio: {}",
+            arb_counter,
+            usual_counter,
+            arb_counter as f32 / usual_counter as f32
+        );
 
         for v in verts.iter_mut() {
             let vn = cgmath::Vector3::from(v.normal);
@@ -327,7 +357,7 @@ impl Mesh {
             // use gram schmidt process to orthogonalize the tangent vec
             let tangent_gs = (vt - (vn * vn.dot(vt))).normalize();
             v.tangent = tangent_gs.into();
-            v.bitangent = tangent_gs.cross(-vn).normalize().into();
+            v.bitangent = vn.cross(tangent_gs).normalize().into();
         }
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -369,11 +399,17 @@ pub trait DrawModel<'a> {
         per_object_bind_group: &'a wgpu::BindGroup,
     );
 
-    fn draw_model(&mut self, model: &'a Model, per_object_bind_group: &'a wgpu::BindGroup);
+    fn draw_model(
+        &mut self,
+        model: &'a Model,
+        materials: &'a Vec<Material>,
+        per_object_bind_group: &'a wgpu::BindGroup,
+    );
     fn draw_model_instanced(
         &mut self,
         model: &'a Model,
         instances: Range<u32>,
+        materials: &'a Vec<Material>,
         per_object_bind_group: &'a wgpu::BindGroup,
     );
 }
@@ -407,18 +443,19 @@ where
         self.draw_indexed(0..mesh.index_count, 0, instances);
     }
 
-    fn draw_model(&mut self, model: &'b Model, per_object_bind_group: &'b wgpu::BindGroup) {
-        self.draw_model_instanced(model, 0..1, per_object_bind_group);
+    fn draw_model(&mut self, model: &'b Model, materials: &'b Vec<Material>, per_object_bind_group: &'b wgpu::BindGroup) {
+        self.draw_model_instanced(model, 0..1, materials, per_object_bind_group);
     }
 
     fn draw_model_instanced(
         &mut self,
         model: &'b Model,
         instances: Range<u32>,
+        materials: &'b Vec<Material>,
         per_object_bind_group: &'b wgpu::BindGroup,
     ) {
         for mesh in &model.meshes {
-            let material = &model.materials[mesh.material];
+            let material = &materials[mesh.material];
             self.draw_mesh_instanced(mesh, material, instances.clone(), per_object_bind_group);
         }
     }

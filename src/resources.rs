@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use cgmath::One;
 
 use crate::{
-    model::{self},
+    model::{self, Material},
     texture,
 };
 
@@ -24,141 +26,134 @@ pub fn load_texture(
 }
 
 pub fn load_material(
-    mtllib_name: &str,
-    material_name: &str,
+    filepath: &str,
+    name: &str,
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     queue: &wgpu::Queue,
-) -> model::Material {
-    let (tm_vec, tm_map) = tobj::load_mtl(mtllib_name).unwrap();
+) -> Result<model::Material, crate::obj_parse::MTLLoadError> {
+    let parsed_mtl = crate::obj_parse::parse_mtl(filepath, name)?;
 
-    let tm = tm_vec
-        .into_iter()
-        .nth(*tm_map.get(&material_name.to_string()).unwrap())
-        .unwrap();
+    let diffuse_texture = parsed_mtl.map_kd.as_ref().and_then(|dtn| {
+        load_texture(
+            &format!("src/assets/materials/{}", dtn),
+            device,
+            queue,
+            false,
+        )
+        .ok()
+    });
 
-    let diffuse_texture = tm
-        .diffuse_texture
-        .as_ref()
-        .and_then(|dtn| load_texture(&format!("src/assets/{}", dtn), device, queue, false).ok());
+    let normal_texture = parsed_mtl.map_bump.as_ref().and_then(|dtn| {
+        load_texture(
+            &format!("src/assets/materials/{}", dtn),
+            device,
+            queue,
+            true,
+        )
+        .ok()
+    });
 
-    let normal_texture = tm
-        .normal_texture
-        .as_ref()
-        .and_then(|dtn| load_texture(&format!("src/assets/{}", dtn), device, queue, true).ok());
-
-    model::Material::new(
+    Ok(model::Material::new(
         device,
-        &tm.name,
+        name,
         diffuse_texture,
         normal_texture,
-        tm.ambient.unwrap_or([0.0; 3]),
-        tm.diffuse.unwrap_or([1.0, 0.0, 1.0]),
-        tm.specular.unwrap_or([1.0; 3]),
+        parsed_mtl.ka.unwrap_or([0.0; 3]),
+        parsed_mtl.kd.unwrap_or([1.0, 0.0, 1.0]),
+        parsed_mtl.ks.unwrap_or([1.0; 3]),
         layout,
-    )
+    ))
 }
 
-pub fn load_obj_model(
-    file_name: &str,
+pub fn load_all_materials(
+    filepath: &str,
+    materials: &mut Vec<model::Material>,
+    material_map: &mut HashMap<String, usize>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
-) -> anyhow::Result<model::Model> {
-    let (models, tobj_materials) = tobj::load_obj(
-        file_name,
-        &tobj::LoadOptions {
-            single_index: true,
-            triangulate: true,
-            ..Default::default()
-        },
-    )?;
-
-    let mut materials = tobj_materials?
-        .iter()
-        .map(|tm| {
-            let diffuse_texture = tm.diffuse_texture.as_ref().and_then(|dtn| {
-                load_texture(&format!("src/assets/{}", dtn), device, queue, false).ok()
+) {
+    let parsed_mtls = crate::obj_parse::parse_all_mtls(filepath)
+        .unwrap()
+        .into_iter()
+        .map(|pmtl| {
+            let diffuse_texture = pmtl.map_kd.as_ref().and_then(|dtn| {
+                load_texture(
+                    &format!("src/assets/materials/{}", dtn),
+                    device,
+                    queue,
+                    false,
+                )
+                .ok()
             });
 
-            let normal_texture = tm.normal_texture.as_ref().and_then(|dtn| {
-                load_texture(&format!("src/assets/{}", dtn), device, queue, true).ok()
+            let normal_texture = pmtl.map_bump.as_ref().and_then(|dtn| {
+                load_texture(
+                    &format!("src/assets/materials/{}", dtn),
+                    device,
+                    queue,
+                    true,
+                )
+                .ok()
             });
 
             model::Material::new(
                 device,
-                &tm.name,
+                &pmtl.name.clone().unwrap_or("NONE".to_string()),
                 diffuse_texture,
                 normal_texture,
-                tm.ambient.unwrap_or([0.0; 3]),
-                tm.diffuse.unwrap_or([1.0, 0.0, 1.0]),
-                tm.specular.unwrap_or([1.0; 3]),
+                pmtl.ka.unwrap_or([0.0; 3]),
+                pmtl.kd.unwrap_or([1.0, 0.0, 1.0]),
+                pmtl.ks.unwrap_or([1.0; 3]),
                 layout,
             )
-        })
-        .collect::<Vec<_>>();
+        });
 
-    if materials.is_empty() {
-        let diffuse_texture =
-            load_texture("src/assets/debug_diffuse.png", device, queue, false).unwrap();
-        let normal_texture =
-            load_texture("src/assets/debug_normal.png", device, queue, true).unwrap();
-
-        materials.push(model::Material::new(
-            device,
-            "DEBUG MATERIAL",
-            Some(diffuse_texture),
-            Some(normal_texture),
-            [1.0; 3],
-            [1.0; 3],
-            [1.0; 3],
-            layout,
-        ))
+    for m in parsed_mtls {
+        println!("loaded mtl {}", &m.name);
+        material_map.insert(m.name.clone(), materials.len());
+        materials.push(m);
     }
+}
 
-    let meshes = models
-        .into_iter()
-        .map(|m| {
-            let vertices = (0..m.mesh.positions.len() / 3)
-                .map(|i| model::ModelVertex {
-                    position: [
-                        m.mesh.positions[i * 3],
-                        m.mesh.positions[i * 3 + 1],
-                        m.mesh.positions[i * 3 + 2],
-                    ],
-                    tex_coords: if m.mesh.texcoords.is_empty() {
-                        [0.0; 2]
-                    } else {
-                        [m.mesh.texcoords[i * 2], 1.0 - m.mesh.texcoords[i * 2 + 1]]
-                    },
-                    normal: if m.mesh.normals.is_empty() {
-                        [0.0, 0.0, 0.0]
-                    } else {
-                        [
-                            m.mesh.normals[i * 3],
-                            m.mesh.normals[i * 3 + 1],
-                            m.mesh.normals[i * 3 + 2],
-                        ]
-                    },
-                    tangent: [0.0, 0.0, 0.0],
-                    bitangent: [0.0, 0.0, 0.0],
-                })
-                .collect::<Vec<_>>();
+pub fn load_obj_model(
+    filepath: &str,
+    materials: &mut Vec<model::Material>,
+    material_map: &mut HashMap<String, usize>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+) -> anyhow::Result<model::Model> {
+    let pobj = crate::obj_parse::parse_obj(filepath).unwrap();
 
-            model::Mesh::from_verts_inds(
-                device,
-                m.name,
-                vertices,
-                m.mesh.indices,
-                m.mesh.material_id.unwrap_or(0),
-            )
-        })
-        .collect::<Vec<_>>();
+    let material = if let Some(mtl) = pobj.material {
+        if material_map.contains_key(&mtl) {
+            println!("material {} already loaded", &mtl);
+            *material_map.get(&mtl).unwrap()
+        } else {
+            println!("loading material {}", &mtl);
+            let new_index = materials.len();
+            materials.push(
+                load_material(&pobj.material_lib.unwrap(), &mtl, device, layout, queue).unwrap(),
+            );
+            material_map.insert(mtl, new_index);
+            new_index
+        }
+    } else {
+        0
+    };
 
+    let mesh = model::Mesh::from_verts_inds(
+        &device,
+        filepath.to_string(),
+        pobj.model_verts,
+        pobj.indices,
+        material,
+    );
     Ok(model::Model {
-        meshes,
-        materials,
-        position: [0.0; 3],
+        meshes: vec![mesh],
+        position: [0.0, 0.0, 0.0],
         rotation: cgmath::Quaternion::one(),
         scale: 1.0,
     })

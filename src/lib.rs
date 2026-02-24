@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use cgmath::{Rotation3, SquareMatrix};
+use cgmath::{One, Rotation3, SquareMatrix};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -21,8 +22,12 @@ use crate::model::{DrawModel, Vertex};
 mod camera;
 mod model;
 mod obj_mesh;
+mod obj_parse;
 mod resources;
 mod texture;
+mod timing;
+
+const ENABLE_DEBUG_TBN: bool = true;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -60,43 +65,98 @@ struct LightUniform {
     _padding4: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TimestampUniform {
+    time: u32,
+}
+
+// TODO:
+// X clean up model loading
+// X clean up debug pipelines
+// X rewrite material loading and remove tobj dependence
+// - generally just reconsider the mesh/model organization
+// - add multiple lights
+// - add proper material batching
+// - add shadows
+// - improve lighting
+
+struct Pipelines {
+    render: wgpu::RenderPipeline, // object which describes the various rendering phases to use
+    render_alt: wgpu::RenderPipeline, // object which describes the various rendering phases to use
+    light_debug: wgpu::RenderPipeline,
+    geometry_debug: wgpu::RenderPipeline,
+}
+
+struct Uniforms {
+    camera: CameraUniform,
+    camera_buffer: wgpu::Buffer,
+
+    light: LightUniform,
+    light_buffer: wgpu::Buffer,
+
+    timestamp: TimestampUniform,
+    timestamp_buffer: wgpu::Buffer,
+
+    model_transform_buffer: wgpu::Buffer,
+}
+
+struct Layouts {
+    per_frame: wgpu::BindGroupLayout,
+    per_pass: wgpu::BindGroupLayout,
+    per_object: wgpu::BindGroupLayout,
+}
+
+struct Variables {
+    is_mouse_pressed: bool,
+    enable_geometry_debug: bool,
+    swap_pipelines: bool,
+    enable_light_rotation: bool,
+}
+
+struct Diagnostics {
+    start_time: std::time::Instant,
+    frame_count: u64,
+    frame_time_avg: timing::RollingAverage,
+    render_time_avg: timing::RollingAverage,
+    update_time_avg: timing::RollingAverage,
+}
+
 pub struct State {
     window: Arc<Window>,                        // the actual window object
-    device: wgpu::Device, // the 'gpu' which we are using (may not necessarily be a dedicated gpu)
+    device: wgpu::Device, // the 'gpu' which is being used (may not necessarily be a dedicated gpu)
     queue: wgpu::Queue,   // the command queue to send things to the device
     surface: wgpu::Surface<'static>, // the target of the rendering
     surface_config: wgpu::SurfaceConfiguration, // configuring the surface (size, colour format, etc)
     is_surface_configured: bool,
-    render_pipeline: wgpu::RenderPipeline, // object which describes the various rendering phases to use
-    debug_light_render_pipeline: wgpu::RenderPipeline,
-    debug_polygon_render_pipeline: wgpu::RenderPipeline,
+
     camera: camera::Camera,
     projection: camera::Projection,
     model: model::Model,
-    debug_light_model: model::Model,
-    per_frame_bind_group: wgpu::BindGroup, // uniforms like camera, lights, etc
-    // per_pass_bind_group: wgpu::BindGroup,  // things like textures, materials, etc
-    per_object_bind_group: wgpu::BindGroup, // local things like model position or rotation, etc
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_controller: camera::CameraController,
-    light_uniform: LightUniform,
-    light_buffer: wgpu::Buffer,
-    model_transform_buffer: wgpu::Buffer,
+    materials: Vec<model::Material>,
+    material_map: HashMap<String, usize>,
+
     depth_texture: texture::Texture,
-    is_mouse_pressed: bool,
-    frame_count: u64,
-    enable_geometry_outline: bool,
-    debug_tbn_extras: DebugTBNStateExtras,
+    debug_tbn_extras: Option<DebugTBNStateExtras>,
+    debug_light_model: model::Model,
+
+    camera_controller: camera::CameraController,
+
+    layouts: Layouts,
+
+    per_frame_bind_group: wgpu::BindGroup, // uniforms like camera, lights, etc
+    per_object_bind_group: wgpu::BindGroup, // local things like model position or rotation, etc
+
+    pipelines: Pipelines,
+    uniforms: Uniforms,
+    diagnostics: Diagnostics,
+    variables: Variables,
 }
 
 struct DebugTBNStateExtras {
     tangent_bind_group: wgpu::BindGroup,
     bitangent_bind_group: wgpu::BindGroup,
     normal_bind_group: wgpu::BindGroup,
-    tangent_material: model::Material,
-    bitangent_material: model::Material,
-    normal_material: model::Material,
     debug_tbn_render_pipeline: wgpu::RenderPipeline,
     debug_tbn_uniforms: [Vec<model::VectorDebugUniform>; 3],
     debug_tangent_buffer: wgpu::Buffer,
@@ -178,15 +238,17 @@ impl State {
         // ---- HIGH LEVEL RENDER CONFIG ----
 
         let light_uniform = LightUniform {
-            position: [7.0, 7.0, 7.0],
+            position: [15.0, 15.0, 15.0],
             _padding1: 0,
-            ambient_color: [0.05, 0.05, 0.05],
+            ambient_color: [0.01, 0.01, 0.01],
             _padding2: 0,
-            diffuse_color: [1.0, 1.0, 1.0],
+            diffuse_color: [0.5, 0.5, 0.5],
             _padding3: 0,
             specular_color: [1.0, 1.0, 1.0],
             _padding4: 0,
         };
+
+        let timestamp_uniform = TimestampUniform { time: 0 };
 
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &surface_config, "depth texture");
@@ -203,6 +265,12 @@ impl State {
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light buffer"),
             contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let timestamp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("timestamp buffer"),
+            contents: bytemuck::cast_slice(&[timestamp_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -226,6 +294,10 @@ impl State {
                     binding: 1,
                     resource: light_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: timestamp_buffer.as_entire_binding(),
+                },
             ],
             label: Some("camera_bind_group"),
         });
@@ -243,18 +315,33 @@ impl State {
 
         // ---- MODEL LOADING ----
 
-        let mut model = resources::load_obj_model(
-            "src/assets/bs_rest.obj",
+        let mut materials = Vec::new();
+        let mut material_map = HashMap::new();
+
+        resources::load_all_materials(
+            "src/assets/materials/all_materials.mtl",
+            &mut materials,
+            &mut material_map,
+            &device,
+            &queue,
+            &per_pass_bind_group_layout,
+        );
+
+        let model = resources::load_obj_model(
+            "src/assets/models/sball3.obj",
+            &mut materials,
+            &mut material_map,
             &device,
             &queue,
             &per_pass_bind_group_layout,
         )
         .unwrap();
-
-        model.scale = 5.0;
+        // model.scale = 16.0;
 
         let debug_light_model = resources::load_obj_model(
-            "src/assets/octahedron.obj",
+            "src/assets/models/octahedron.obj",
+            &mut materials,
+            &mut material_map,
             &device,
             &queue,
             &per_pass_bind_group_layout,
@@ -276,6 +363,31 @@ impl State {
                 });
 
             let shader_descriptor = wgpu::include_wgsl!("shaders/shader.wgsl");
+
+            Self::create_render_pipeline(
+                &device,
+                &render_pipeline_layout,
+                surface_config.format,
+                Some(texture::Texture::DEPTH_FORMAT),
+                &[model::ModelVertex::desc()],
+                shader_descriptor,
+                wgpu::PolygonMode::Fill,
+            )
+        };
+
+        let render_pipeline_alt = {
+            let render_pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("render pipeline layout"),
+                    bind_group_layouts: &[
+                        &per_frame_bind_group_layout,
+                        &per_pass_bind_group_layout,
+                        &per_object_bind_group_layout,
+                    ],
+                    immediate_size: 0,
+                });
+
+            let shader_descriptor = wgpu::include_wgsl!("shaders/shader2.wgsl");
 
             Self::create_render_pipeline(
                 &device,
@@ -332,45 +444,64 @@ impl State {
             )
         };
 
-        let debug_tbn_extras = Self::create_debug_extras(
-            &device,
-            &queue,
-            &surface_config,
-            &model,
-            &model_transform_buffer,
-            per_frame_bind_group_layout,
-            per_pass_bind_group_layout,
-        );
-
-        Ok(Self {
+        let mut state = Self {
             window,
             device,
             queue,
             surface,
             surface_config,
             is_surface_configured: true,
-            render_pipeline,
-            debug_light_render_pipeline,
-            debug_polygon_render_pipeline,
+            pipelines: Pipelines {
+                render: render_pipeline,
+                render_alt: render_pipeline_alt,
+                light_debug: debug_light_render_pipeline,
+                geometry_debug: debug_polygon_render_pipeline,
+            },
             camera,
             projection,
             model,
             debug_light_model,
+            layouts: Layouts {
+                per_frame: per_frame_bind_group_layout,
+                per_pass: per_pass_bind_group_layout,
+                per_object: per_object_bind_group_layout,
+            },
             per_frame_bind_group,
-            // per_pass_bind_group,
             per_object_bind_group,
-            camera_uniform,
-            camera_buffer,
             camera_controller,
-            light_uniform,
-            light_buffer,
-            model_transform_buffer,
+            uniforms: Uniforms {
+                camera: camera_uniform,
+                camera_buffer,
+                light: light_uniform,
+                light_buffer,
+                timestamp: timestamp_uniform,
+                timestamp_buffer,
+                model_transform_buffer,
+            },
             depth_texture,
-            is_mouse_pressed: false,
-            frame_count: 0,
-            enable_geometry_outline: false,
-            debug_tbn_extras,
-        })
+            diagnostics: Diagnostics {
+                start_time: std::time::Instant::now(),
+                frame_count: 0,
+                frame_time_avg: timing::RollingAverage::new(200),
+                render_time_avg: timing::RollingAverage::new(200),
+                update_time_avg: timing::RollingAverage::new(200),
+            },
+            variables: Variables {
+                is_mouse_pressed: false,
+                enable_geometry_debug: false,
+                swap_pipelines: false,
+                enable_light_rotation: false,
+            },
+            debug_tbn_extras: None,
+            materials: materials,
+            material_map: material_map,
+        };
+
+        if ENABLE_DEBUG_TBN {
+            state.debug_tbn_extras = Some(Self::create_debug_extras(&mut state));
+        }
+
+        Ok(state)
     }
 
     fn create_camera(
@@ -426,6 +557,17 @@ impl State {
                 // light uniform
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // timestamp uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -508,69 +650,78 @@ impl State {
         (per_frame, per_pass, per_object)
     }
 
-    fn create_debug_extras(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        surface_config: &wgpu::SurfaceConfiguration,
-        model: &model::Model,
-        model_transform_buffer: &wgpu::Buffer,
-        per_frame_bind_group_layout: wgpu::BindGroupLayout,
-        per_pass_bind_group_layout: wgpu::BindGroupLayout,
-    ) -> DebugTBNStateExtras {
+    fn create_debug_extras(state: &mut Self) -> DebugTBNStateExtras {
         let per_object_debug_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("debug TBN per object bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+            state
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("debug TBN per object bind group layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
                         },
-                        count: None,
-                    },
-                ],
-            });
+                    ],
+                });
 
-        let debug_tbn_uniforms = model::VectorDebugUniform::from_mesh_tbn(&model.meshes[0]);
+        let debug_tbn_uniforms = model::VectorDebugUniform::from_mesh_tbn(&state.model.meshes[0]);
 
-        let debug_tangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug TBN buffer"),
-            contents: bytemuck::cast_slice(&debug_tbn_uniforms[0][..]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        println!("t count: {}", debug_tbn_uniforms[0].len());
+        println!("b count: {}", debug_tbn_uniforms[1].len());
+        println!("n count: {}", debug_tbn_uniforms[2].len());
 
-        let debug_bitangent_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug TBN buffer"),
-            contents: bytemuck::cast_slice(&debug_tbn_uniforms[1][..]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        println!("vertex count: {}", state.model.meshes[0].verts.len());
 
-        let debug_normal_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("debug TBN buffer"),
-            contents: bytemuck::cast_slice(&debug_tbn_uniforms[2][..]),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        let debug_tangent_buffer =
+            state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("debug TBN buffer"),
+                    contents: bytemuck::cast_slice(&debug_tbn_uniforms[0][..]),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
 
-        let tangent_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let debug_bitangent_buffer =
+            state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("debug TBN buffer"),
+                    contents: bytemuck::cast_slice(&debug_tbn_uniforms[1][..]),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+
+        let debug_normal_buffer =
+            state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("debug TBN buffer"),
+                    contents: bytemuck::cast_slice(&debug_tbn_uniforms[2][..]),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                });
+
+        let tangent_bind_group = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debug tbn tangent bind group"),
             layout: &per_object_debug_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: model_transform_buffer.as_entire_binding(),
+                    resource: state.uniforms.model_transform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -579,13 +730,13 @@ impl State {
             ],
         });
 
-        let bitangent_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bitangent_bind_group = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debug tbn bitangent bind group"),
             layout: &per_object_debug_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: model_transform_buffer.as_entire_binding(),
+                    resource: state.uniforms.model_transform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -594,13 +745,13 @@ impl State {
             ],
         });
 
-        let normal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let normal_bind_group = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debug tbn normal bind group"),
             layout: &per_object_debug_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: model_transform_buffer.as_entire_binding(),
+                    resource: state.uniforms.model_transform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -610,59 +761,39 @@ impl State {
         });
 
         let debug_vector_model = resources::load_obj_model(
-            "src/assets/arrow.obj",
-            &device,
-            &queue,
-            &per_pass_bind_group_layout,
+            "src/assets/models/arrow.obj",
+            &mut state.materials,
+            &mut state.material_map,
+            &state.device,
+            &state.queue,
+            &state.layouts.per_pass,
         )
         .unwrap();
 
-        let tangent_material = resources::load_material(
-            "src/assets/all_materials.mtl",
-            "blue",
-            &device,
-            &per_pass_bind_group_layout,
-            &queue,
-        );
-
-        let bitangent_material = resources::load_material(
-            "src/assets/all_materials.mtl",
-            "green",
-            &device,
-            &per_pass_bind_group_layout,
-            &queue,
-        );
-
-        let normal_material = resources::load_material(
-            "src/assets/all_materials.mtl",
-            "red",
-            &device,
-            &per_pass_bind_group_layout,
-            &queue,
-        );
-
         let debug_tbn_render_pipeline = {
             let render_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("debug TBN layout"),
-                    bind_group_layouts: &[
-                        &per_frame_bind_group_layout,
-                        &per_pass_bind_group_layout,
-                        &per_object_debug_bind_group_layout,
-                    ],
-                    immediate_size: 0,
-                });
+                state
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("debug TBN layout"),
+                        bind_group_layouts: &[
+                            &state.layouts.per_frame,
+                            &state.layouts.per_pass,
+                            &per_object_debug_bind_group_layout,
+                        ],
+                        immediate_size: 0,
+                    });
 
             let shader_descriptor = wgpu::include_wgsl!("shaders/debug_vector.wgsl");
 
             Self::create_render_pipeline(
-                &device,
+                &state.device,
                 &render_pipeline_layout,
-                surface_config.format,
+                state.surface_config.format,
                 Some(texture::Texture::DEPTH_FORMAT),
                 &[model::ModelVertex::desc()],
                 shader_descriptor,
-                wgpu::PolygonMode::Fill,
+                wgpu::PolygonMode::Line,
             )
         };
 
@@ -670,9 +801,6 @@ impl State {
             tangent_bind_group,
             bitangent_bind_group,
             normal_bind_group,
-            tangent_material,
-            bitangent_material,
-            normal_material,
             debug_tbn_render_pipeline,
             debug_tbn_uniforms,
             debug_tangent_buffer,
@@ -683,30 +811,33 @@ impl State {
     }
 
     pub fn update(&mut self, dt: Duration) {
-        // dbg!(&self.camera);
         self.camera_controller.update_camera(&mut self.camera, dt);
-        self.camera_uniform
+        self.uniforms
+            .camera
             .update_view_proj(&self.camera, &self.projection);
         self.queue.write_buffer(
-            &self.camera_buffer,
+            &self.uniforms.camera_buffer,
             0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
+            bytemuck::cast_slice(&[self.uniforms.camera]),
         );
 
-        // self.light_uniform.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.3))
-        //     * cgmath::Vector3::from(self.light_uniform.position))
-        // .into();
+        if self.variables.enable_light_rotation {
+            self.uniforms.light.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.1))
+                * cgmath::Vector3::from(self.uniforms.light.position))
+            .into();
+        }
         self.queue.write_buffer(
-            &self.light_buffer,
+            &self.uniforms.light_buffer,
             0,
-            bytemuck::cast_slice(&[self.light_uniform]),
+            bytemuck::cast_slice(&[self.uniforms.light]),
         );
-        // self.model.rotation = cgmath::Quaternion::from_axis_angle(cgmath::Vector3::new(1.0, -1.0, 1.0).normalize(), cgmath::Deg(self.frame_count as f32 * 0.05))
-        // self.model.rotation = cgmath::Quaternion::from_axis_angle(
-        //     cgmath::Vector3::unit_y(),
-        //     cgmath::Deg(self.frame_count as f32 * 0.02),
-        // );
-        // self.model.position = [-5.0, -5.0, 0.0];
+
+        self.uniforms.timestamp.time = self.diagnostics.start_time.elapsed().as_millis() as u32;
+        self.queue.write_buffer(
+            &self.uniforms.timestamp_buffer,
+            0,
+            bytemuck::cast_slice(&[self.uniforms.timestamp]),
+        );
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -786,10 +917,14 @@ impl State {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            if self.variables.swap_pipelines {
+                render_pass.set_pipeline(&self.pipelines.render_alt);
+            } else {
+                render_pass.set_pipeline(&self.pipelines.render);
+            }
 
             self.queue.write_buffer(
-                &self.model_transform_buffer,
+                &self.uniforms.model_transform_buffer,
                 0,
                 bytemuck::cast_slice(&[model::ModelTransformationUniform::from_model(&self.model)]),
             );
@@ -798,46 +933,56 @@ impl State {
             // render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
             // render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
-            render_pass.draw_model(&self.model, &self.per_object_bind_group);
+            render_pass.draw_model(&self.model, &self.materials, &self.per_object_bind_group);
 
-            render_pass.set_pipeline(&self.debug_light_render_pipeline);
+            render_pass.set_pipeline(&self.pipelines.light_debug);
 
             // render_pass.set_bind_group(0, &self.per_frame_bind_group, &[]);
             // render_pass.set_bind_group(1, &self.per_pass_bind_group, &[]);
             // render_pass.set_bind_group(2, &self.per_object_bind_group, &[]);
 
-            render_pass.draw_model(&self.debug_light_model, &self.per_frame_bind_group);
+            render_pass.draw_model(
+                &self.debug_light_model,
+                &self.materials,
+                &self.per_frame_bind_group,
+            );
 
-            if self.enable_geometry_outline {
-                render_pass.set_pipeline(&self.debug_polygon_render_pipeline);
-                render_pass.draw_model(&self.model, &self.per_object_bind_group);
+            if self.variables.enable_geometry_debug {
+                if let Some(debug_extras) = &self.debug_tbn_extras {
+                    render_pass.set_pipeline(&self.pipelines.geometry_debug);
+                    render_pass.draw_model(
+                        &self.model,
+                        &self.materials,
+                        &self.per_object_bind_group,
+                    );
 
-                render_pass.set_pipeline(&self.debug_tbn_extras.debug_tbn_render_pipeline);
-                render_pass.draw_mesh_instanced(
-                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
-                    &self.debug_tbn_extras.tangent_material,
-                    0..(self.debug_tbn_extras.debug_tbn_uniforms[0].len() as u32),
-                    &self.debug_tbn_extras.tangent_bind_group,
-                );
-                render_pass.draw_mesh_instanced(
-                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
-                    &self.debug_tbn_extras.bitangent_material,
-                    0..(self.debug_tbn_extras.debug_tbn_uniforms[1].len() as u32),
-                    &self.debug_tbn_extras.bitangent_bind_group,
-                );
-                render_pass.draw_mesh_instanced(
-                    &self.debug_tbn_extras.debug_vector_model.meshes[0],
-                    &self.debug_tbn_extras.normal_material,
-                    0..(self.debug_tbn_extras.debug_tbn_uniforms[2].len() as u32),
-                    &self.debug_tbn_extras.normal_bind_group,
-                );
+                    render_pass.set_pipeline(&debug_extras.debug_tbn_render_pipeline);
+                    render_pass.draw_mesh_instanced(
+                        &debug_extras.debug_vector_model.meshes[0],
+                        &self.materials[*self.material_map.get("blue").unwrap_or(&0)],
+                        0..(debug_extras.debug_tbn_uniforms[0].len() as u32),
+                        &debug_extras.tangent_bind_group,
+                    );
+                    render_pass.draw_mesh_instanced(
+                        &debug_extras.debug_vector_model.meshes[0],
+                        &self.materials[*self.material_map.get("green").unwrap_or(&0)],
+                        0..(debug_extras.debug_tbn_uniforms[1].len() as u32),
+                        &debug_extras.bitangent_bind_group,
+                    );
+                    render_pass.draw_mesh_instanced(
+                        &debug_extras.debug_vector_model.meshes[0],
+                        &self.materials[*self.material_map.get("red").unwrap_or(&0)],
+                        0..(debug_extras.debug_tbn_uniforms[2].len() as u32),
+                        &debug_extras.normal_bind_group,
+                    );
+                }
             }
         }
 
         // close the command encoder and submit the instructions to the gpu's render queue
         self.queue.submit(std::iter::once(command_encoder.finish()));
 
-        self.frame_count += 1;
+        self.diagnostics.frame_count += 1;
 
         // put the output from the rendering onto the window
         target_surface.present();
@@ -847,11 +992,19 @@ impl State {
     pub fn handle_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
         match (code, is_pressed) {
             (KeyCode::Escape, true) => event_loop.exit(),
-            (KeyCode::KeyG, true) => self.enable_geometry_outline = !self.enable_geometry_outline,
+            (KeyCode::KeyG, true) => {
+                self.variables.enable_geometry_debug = !self.variables.enable_geometry_debug
+            }
+            (KeyCode::KeyC, true) => {
+                self.variables.swap_pipelines = !self.variables.swap_pipelines;
+            }
+            (KeyCode::KeyL, true) => {
+                self.variables.enable_light_rotation = !self.variables.enable_light_rotation
+            }
             (KeyCode::KeyR, true) => {
                 self.model.rotation = cgmath::Quaternion::from_axis_angle(
                     cgmath::Vector3::unit_y(),
-                    cgmath::Deg(self.frame_count as f32 * 0.1),
+                    cgmath::Deg(self.diagnostics.frame_count as f32 * 0.1),
                 )
             }
             _ => {
@@ -862,7 +1015,7 @@ impl State {
 
     fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
         match button {
-            MouseButton::Left => self.is_mouse_pressed = pressed,
+            MouseButton::Left => self.variables.is_mouse_pressed = pressed,
             _ => {}
         }
     }
@@ -1031,7 +1184,7 @@ impl ApplicationHandler<State> for App {
                 DeviceEvent::MouseMotion {
                     delta: (mouse_dx, mouse_dy),
                 } => {
-                    if state.is_mouse_pressed {
+                    if state.variables.is_mouse_pressed {
                         state.camera_controller.handle_mouse(mouse_dx, mouse_dy);
                     }
                 }
@@ -1047,7 +1200,7 @@ impl ApplicationHandler<State> for App {
         event: WindowEvent,
     ) {
         let state = match &mut self.state {
-            Some(canvas) => canvas,
+            Some(state) => state,
             None => return,
         };
 
@@ -1058,8 +1211,12 @@ impl ApplicationHandler<State> for App {
                 let dt = self.last_instant.elapsed();
                 self.last_instant = Instant::now();
 
+                let before_update = Instant::now();
                 state.update(dt);
 
+                let update_time = before_update.elapsed();
+
+                let before_render = Instant::now();
                 match state.render() {
                     Ok(_) => {}
                     // reconfigure the surface if it's lost or outdated
@@ -1071,6 +1228,30 @@ impl ApplicationHandler<State> for App {
                         log::error!("[error] unable to render {}", e);
                     }
                 };
+
+                state
+                    .diagnostics
+                    .update_time_avg
+                    .push(update_time.as_micros() as f32);
+                state.diagnostics.frame_time_avg.push(dt.as_secs_f32());
+                state
+                    .diagnostics
+                    .render_time_avg
+                    .push(before_render.elapsed().as_micros() as f32);
+
+                state.window.set_title(&format!(
+                    "graphics fundamentals - dpb4        |  fps {: >3}   |   mspf {: >3} ms   |   rt {: >6} us   |   ru {: >3} %  |   ut {: >6} us   |   uu {: >3} %  |   {}",
+                    (1.0 / state.diagnostics.frame_time_avg.get()) as u32,
+                    (state.diagnostics.frame_time_avg.get() * 1000.0) as u32,
+
+                    state.diagnostics.render_time_avg.get() as u32,
+                    (state.diagnostics.render_time_avg.get() / (1.0 / 240.0 * 1000000.0)) as u32,
+
+                    state.diagnostics.update_time_avg.get() as u32,
+                    (state.diagnostics.update_time_avg.get() / (1.0 / 240.0 * 1000000.0)) as u32,
+
+                    if state.variables.swap_pipelines { "[ALT PIPELINE]" } else {""}
+                ));
             }
             WindowEvent::KeyboardInput {
                 event:

@@ -18,10 +18,16 @@ struct Light {
     specular_color: vec3f,
 }
 
+struct Time {
+    millis: u32,
+}
+
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 @group(0) @binding(1)
 var<uniform> light: Light;
+@group(0) @binding(2)
+var<uniform> time: Time;
 
 struct ModelTransformation {
     model_transform_col0: vec4f,
@@ -44,11 +50,10 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) clip_position: vec4f,
     @location(0) tex_coords: vec2f,
-    @location(1) world_normal: vec3f,
-    @location(2) world_position: vec3f,
-    @location(3) tangent_light_direction: vec3f,
-    @location(4) tangent_view_direction: vec3f,
-    @location(5) tangent_half_direction: vec3f,
+    @location(1) world_position: vec3f,
+    @location(2) world_tangent: vec3f,
+    @location(3) world_bitangent: vec3f,
+    @location(4) world_normal: vec3f,
 }
 
 @vertex
@@ -65,27 +70,17 @@ fn vertex_main(vertex: VertexInput) -> VertexOutput {
     // TODO this only works if the model transformation is orthogonal ie no stretching/skewing
     let normal_transformation_matrix = mat3x3f(model_transformation_matrix[0].xyz, model_transformation_matrix[1].xyz, model_transformation_matrix[2].xyz);
 
-    let world_normal = normalize(normal_transformation_matrix * vertex.normal);
-    let world_tangent = normalize(normal_transformation_matrix * vertex.tangent);
-    let world_bitangent = normalize(normal_transformation_matrix * vertex.bitangent);
-
-    let tangent_transformation_matrix = transpose(mat3x3f(world_tangent, world_bitangent, world_normal));
-
     let world_position_h = model_transformation_matrix * vec4f(vertex.position, 1.0);
 
     out.clip_position = camera.view_proj * world_position_h;
     out.tex_coords = vertex.tex_coords;
-    out.world_normal   = world_normal;
+
     out.world_position = world_position_h.xyz;
 
+    out.world_normal = normalize(normal_transformation_matrix * vertex.normal);
+    out.world_tangent = normalize(normal_transformation_matrix * vertex.tangent);
+    out.world_bitangent = normalize(normal_transformation_matrix * vertex.bitangent);
 
-    let light_direction = light.position - world_position_h.xyz;
-    let view_direction = camera.view_pos.xyz - world_position_h.xyz;
-    let half_direction = (light_direction + view_direction) * 0.5;
-
-    out.tangent_light_direction = normalize(tangent_transformation_matrix * light_direction);
-    out.tangent_view_direction = normalize(tangent_transformation_matrix * view_direction);
-    out.tangent_half_direction = normalize(tangent_transformation_matrix * half_direction);
     // out.tangent_position       = world_normal;
     // out.tangent_view_position  = vertex.tangent;
     // out.tangent_light_position = world_bitangent;
@@ -122,7 +117,7 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
 
     var material_diffuse_color: vec3f;
 
-    if material.has_diffuse_texture == 1{
+    if material.has_diffuse_texture == 1 {
         material_diffuse_color = textureSample(diffuse_texture, diffuse_sampler, in.tex_coords).xyz;
     } else {
         material_diffuse_color = material.diffuse_color;
@@ -131,19 +126,29 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
 
     var material_normal: vec3f;
 
-    if material.has_normal_texture == 1{
+    if material.has_normal_texture == 1 {
         material_normal = textureSample(normal_texture, normal_sampler, in.tex_coords).xyz * 2.0 - 1;
     } else {
         material_normal = vec3f(0.0, 0.0, 1.0);
     }
 
+    let TBN = transpose(mat3x3f(
+        normalize(in.world_tangent), 
+        normalize(in.world_bitangent), 
+        normalize(in.world_normal)
+    ));
+
+    let light_dir_world = light.position - in.world_position;
+    let view_dir_world  = camera.view_pos.xyz - in.world_position;
     // lighting vectors:
     // let tangent_normal = material_normal.xyz * 2.0 - 1.0; // map from [0, 1] to [-1, 1]
     let normal = normalize(material_normal.xyz);
+    // let normal = vec3f(0.0, 0.0, 1.0);
     // let light_direction = normalize(in.tangent_light_position - in.tangent_position); // vector from point to light (in tangent space)
-    let light_direction = in.tangent_light_direction; 
-    let view_direction = in.tangent_view_direction; 
-    let half_direction = in.tangent_half_direction; 
+    let light_direction = normalize(TBN * light_dir_world);
+    let view_direction  = normalize(TBN * view_dir_world);
+    // let half_direction = in.tangent_half_direction; 
+    let half_direction  = normalize(light_direction + view_direction);
 
     // let reflect_direction = normalize(reflect(-light_direction, view_direction));
 
@@ -152,8 +157,9 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
     let light_diffuse = light.diffuse_color * diffuse_strength;
 
     // let reflect_direction = reflect(-light_direction, normal);
+    // let specular_exponent = ((sin(f32(time.millis) / 1000.0) + 1.0) * 0.5) * 256.0 + 1.0;
     // let specular_strength = pow(max(dot(view_direction, reflect_direction), 0.0), 128.0); // just phong
-    let specular_strength = pow(max(dot(normal, half_direction), 0.0), 32.0); // blinn phong
+    let specular_strength = pow(max(dot(normal, half_direction), 0.0), 64.0) * diffuse_strength; // blinn phong
     let light_specular = light.specular_color * specular_strength;
     // let specular_strength = 0.0;
 
@@ -163,7 +169,11 @@ fn fragment_main(in: VertexOutput) -> @location(0) vec4f {
     // let angle = dot(view_direction, reflect_direction);
     // let angle = (dot(in.view, half_direction) + 1.0) * 0.5;
 
+    // let output_color = (light_diffuse);
     // let output_color = (light_specular);
+    // let output_color = (light.ambient_color + light_diffuse + light_specular);
+
+    // let output_color = vec3f(angle, 0.0, 1.0-angle);
 
     let output_color = (light.ambient_color + light_diffuse + light_specular) * material_diffuse_color;
     // let output_color = (light_diffuse) * material_diffuse_color;

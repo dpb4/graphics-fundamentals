@@ -82,7 +82,7 @@ fn vertex_main(vertex: VertexInput, @builtin(instance_index) i: u32) -> VertexOu
 
     let rot = I + vx + ((1.0 / (1 + dot(a, b))) * vx * vx);
 
-    let position_offset = (rot * vertex.position * 0.0004) + dv.position.xyz;
+    let position_offset = (rot * vertex.position * 0.00008) + dv.position.xyz;
 
     let world_position_h = model_transformation_matrix * vec4f(position_offset, 1.0);
 
