@@ -13,9 +13,18 @@ struct Camera {
 
 struct Light {
     position: vec3f,
-    ambient_color: vec3f,
-    diffuse_color: vec3f,
-    specular_color: vec3f,
+    direction: vec3f,
+    color: vec3f,
+    params: vec4f,
+}
+
+struct LightMetadata {
+    point_light_count: u32,
+    point_light_offset: u32,
+    directional_light_count: u32,
+    directional_light_offset: u32,
+    spot_light_count: u32,
+    spot_light_offset: u32,
 }
 
 struct Time {
@@ -25,8 +34,10 @@ struct Time {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 @group(0) @binding(1)
-var<uniform> light: Light;
+var<storage, read> lights: array<Light>;
 @group(0) @binding(2)
+var<uniform> light_metadata: LightMetadata;
+@group(0) @binding(3)
 var<uniform> time: Time;
 
 struct ModelTransformation {

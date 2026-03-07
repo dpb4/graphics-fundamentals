@@ -25,60 +25,22 @@ mod obj_parse;
 mod resources;
 mod texture;
 mod timing;
+mod uniforms;
 
 const ENABLE_DEBUG_TBN: bool = true;
 
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    position: [f32; 4],
-    view_projection_matrix: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            position: [0.0; 4],
-            view_projection_matrix: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
-        self.position = camera.position.to_homogeneous().into();
-        self.view_projection_matrix =
-            (projection.perspective_matrix() * camera.view_matrix()).into()
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-// padding fields are necessary because uniforms require 16 byte alignment
-struct LightUniform {
-    position: [f32; 3],
-    _padding1: u32,
-    ambient_color: [f32; 3],
-    _padding2: u32,
-    diffuse_color: [f32; 3],
-    _padding3: u32,
-    specular_color: [f32; 3],
-    _padding4: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct TimestampUniform {
-    time: u32,
-}
-
-// TODO:
-// X clean up model loading
-// X clean up debug pipelines
-// X rewrite material loading and remove tobj dependence
-// - generally just reconsider the mesh/model organization
-// - add multiple lights
-// - add proper material batching
-// - add shadows
-// - improve lighting
+/*
+TODO:
+X clean up model loading
+X clean up debug pipelines
+X rewrite material loading and remove tobj dependence
+- generally just reconsider the mesh/model organization
+- add multiple lights
+- add proper material batching
+- add shadows
+- improve lighting
+- add egui
+*/
 
 struct Pipelines {
     render: wgpu::RenderPipeline, // object which describes the various rendering phases to use
@@ -88,13 +50,16 @@ struct Pipelines {
 }
 
 struct Uniforms {
-    camera: CameraUniform,
+    camera: uniforms::CameraUniform,
     camera_buffer: wgpu::Buffer,
 
-    light: LightUniform,
+    lights: Vec<uniforms::LightUniform>,
     light_buffer: wgpu::Buffer,
 
-    timestamp: TimestampUniform,
+    light_metadata: uniforms::LightMetadataUniform,
+    light_metadata_buffer: wgpu::Buffer,
+
+    timestamp: uniforms::TimestampUniform,
     timestamp_buffer: wgpu::Buffer,
 
     model_transform_buffer: wgpu::Buffer,
@@ -135,6 +100,10 @@ pub struct State {
     materials: Vec<model::Material>,
     material_map: HashMap<String, usize>,
 
+    point_lights: Vec<PointLight>,
+    directional_lights: Vec<DirectionalLight>,
+    spot_lights: Vec<SpotLight>,
+
     depth_texture: texture::Texture,
     debug_tbn_extras: Option<DebugTBNStateExtras>,
     debug_light_model: model::Model,
@@ -164,11 +133,32 @@ struct DebugTBNStateExtras {
     debug_vector_model: model::Model,
 }
 
+#[derive(Debug, Copy, Clone)]
+struct PointLight {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+#[derive(Debug, Copy, Clone)]
+struct DirectionalLight {
+    direction: [f32; 3],
+    color: [f32; 3],
+}
+
+#[derive(Debug, Copy, Clone)]
+struct SpotLight {
+    position: [f32; 3],
+    direction: [f32; 3],
+    color: [f32; 3],
+    inner_angular_radius: f32,
+    outer_angular_radius: f32,
+}
+
 impl State {
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
-        // ---- DEVICE/SURFACE CONFIG ----
+        // MARK: DEVICE CONFIG
 
         // an 'instance' is a handle to the gpu which can get the device (adapter) or create surfaces
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -234,36 +224,43 @@ impl State {
         let (camera, projection, camera_uniform, camera_buffer) =
             Self::create_camera(&device, &surface_config);
 
-        // ---- HIGH LEVEL RENDER CONFIG ----
+        // MARK: HIGH LEVEL CONFIG
 
-        let light_uniform = LightUniform {
+        let point_lights = vec![PointLight {
             position: [15.0, 15.0, 15.0],
-            _padding1: 0,
-            ambient_color: [0.01, 0.01, 0.01],
-            _padding2: 0,
-            diffuse_color: [0.5, 0.5, 0.5],
-            _padding3: 0,
-            specular_color: [1.0, 1.0, 1.0],
-            _padding4: 0,
-        };
+            color: [1.0; 3],
+        }];
 
-        let timestamp_uniform = TimestampUniform { time: 0 };
+        let directional_lights = vec![];
+
+        let spot_lights = vec![];
+
+        let (light_uniforms, light_metadata_uniform) =
+            uniforms::create_light_uniforms(&point_lights, &directional_lights, &spot_lights);
+
+        let timestamp_uniform = uniforms::TimestampUniform { time: 0 };
 
         let depth_texture =
             texture::Texture::create_depth_texture(&device, &surface_config, "depth texture");
 
-        // ---- BIND GROUP LAYOUTS ----
+        // MARK: BIND GROUP LAYOUTS
 
         // a BindGroup describes a set of resources and how they can be accessed by the shader(s)
 
         let (per_frame_bind_group_layout, per_pass_bind_group_layout, per_object_bind_group_layout) =
             Self::create_bind_group_layouts(&device);
 
-        // ---- BUFFERS ----
+        // MARK: BUFFERS
 
         let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("light buffer"),
-            contents: bytemuck::cast_slice(&[light_uniform]),
+            contents: bytemuck::cast_slice(light_uniforms.as_slice()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let light_metadata_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("light metadata buffer"),
+            contents: bytemuck::cast_slice(&[light_metadata_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -279,7 +276,7 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // ---- BIND GROUPS ----
+        // MARK: BIND GROUPS
 
         // bind group layouts can be be reused with various different bind groups to allow swapping the data on the fly
         let per_frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -295,6 +292,10 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: light_metadata_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: timestamp_buffer.as_entire_binding(),
                 },
             ],
@@ -312,7 +313,7 @@ impl State {
             }],
         });
 
-        // ---- MODEL LOADING ----
+        // MARK: MODEL LOADING
 
         let mut materials = Vec::new();
         let mut material_map = HashMap::new();
@@ -347,7 +348,7 @@ impl State {
         )
         .unwrap();
 
-        // ---- RENDER PIPELINES ----
+        // MARK: RENDER PIPELINES
 
         let render_pipeline = {
             let render_pipeline_layout =
@@ -471,11 +472,13 @@ impl State {
             uniforms: Uniforms {
                 camera: camera_uniform,
                 camera_buffer,
-                light: light_uniform,
                 light_buffer,
                 timestamp: timestamp_uniform,
                 timestamp_buffer,
                 model_transform_buffer,
+                lights: light_uniforms,
+                light_metadata: light_metadata_uniform,
+                light_metadata_buffer: light_metadata_buffer,
             },
             depth_texture,
             diagnostics: Diagnostics {
@@ -494,6 +497,9 @@ impl State {
             debug_tbn_extras: None,
             materials: materials,
             material_map: material_map,
+            point_lights,
+            directional_lights,
+            spot_lights,
         };
 
         if ENABLE_DEBUG_TBN {
@@ -503,13 +509,15 @@ impl State {
         Ok(state)
     }
 
+    // MARK: NEW DONE
+
     fn create_camera(
         device: &wgpu::Device,
         surface_config: &wgpu::SurfaceConfiguration,
     ) -> (
         camera::Camera,
         camera::Projection,
-        CameraUniform,
+        uniforms::CameraUniform,
         wgpu::Buffer,
     ) {
         let camera = camera::Camera::new([0.0, 0.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(0.0));
@@ -521,7 +529,7 @@ impl State {
             100.0,
         );
 
-        let mut camera_uniform = CameraUniform::new();
+        let mut camera_uniform = uniforms::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -558,6 +566,17 @@ impl State {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // light metadata uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
@@ -566,7 +585,7 @@ impl State {
                 },
                 // timestamp uniform
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -820,16 +839,16 @@ impl State {
             bytemuck::cast_slice(&[self.uniforms.camera]),
         );
 
-        if self.variables.enable_light_rotation {
-            self.uniforms.light.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.1))
-                * cgmath::Vector3::from(self.uniforms.light.position))
-            .into();
-        }
-        self.queue.write_buffer(
-            &self.uniforms.light_buffer,
-            0,
-            bytemuck::cast_slice(&[self.uniforms.light]),
-        );
+        // if self.variables.enable_light_rotation {
+        //     self.uniforms.light.position = (cgmath::Quaternion::from_angle_z(cgmath::Deg(0.1))
+        //         * cgmath::Vector3::from(self.uniforms.light.position))
+        //     .into();
+        // }
+        // self.queue.write_buffer(
+        //     &self.uniforms.light_buffer,
+        //     0,
+        //     bytemuck::cast_slice(&[self.uniforms.light]),
+        // );
 
         self.uniforms.timestamp.time = self.diagnostics.start_time.elapsed().as_millis() as u32;
         self.queue.write_buffer(
